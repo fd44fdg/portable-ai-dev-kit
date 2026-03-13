@@ -1,0 +1,36 @@
+# OS and editor noise
+Thumbs.db
+Desktop.ini
+*.lnk
+System Volume Information/
+
+# Local configuration
+config/local.ps1
+
+# Runtime state and logs
+state/**
+!state/.keep
+logs/**
+cache/**
+workspace/**
+
+# Portable app installs and downloads
+apps/**
+
+# Tool runtime artifacts
+tools/*/node_modules/
+tools/*/node_modules.partial-*/
+tools/*/.iflow/
+tools/*/bin/
+
+# Keep wrapper/package metadata versionable
+!tools/*/.keep
+!tools/*/*.cmd
+!tools/*/*.ps1
+!tools/*/*.mjs
+!tools/*/package.json
+!tools/*/package-lock.json
+
+# Python noise
+__pycache__/
+*.pyc

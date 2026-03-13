@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "tools": [
+    {
+      "name": "git",
+      "kind": "runtime",
+      "required": true,
+      "basePath": "apps/git",
+      "archiveName": "git-portable.zip",
+      "source": "drop-local-archive",
+      "binPaths": [
+        "mingw64/bin/git.exe",
+        "cmd/git.exe",
+        "bin/git.exe"
+      ],
+      "installHint": "Place a portable Git distribution under apps/git."
+    },
+    {
+      "name": "node",
+      "kind": "runtime",
+      "required": true,
+      "basePath": "apps/node",
+      "archiveName": "node-portable.zip",
+      "source": "drop-local-archive",
+      "binPaths": [
+        "node.exe"
+      ],
+      "installHint": "Place a portable Node.js distribution under apps/node."
+    },
+    {
+      "name": "python",
+      "kind": "runtime",
+      "required": false,
+      "basePath": "apps/python",
+      "archiveName": "python-portable.zip",
+      "source": "drop-local-archive",
+      "binPaths": [
+        "python.exe"
+      ],
+      "installHint": "Place an embeddable or portable Python distribution under apps/python."
+    },
+    {
+      "name": "terminal",
+      "kind": "app",
+      "required": false,
+      "basePath": "apps/terminal",
+      "archiveName": "terminal-portable.zip",
+      "source": "drop-local-archive",
+      "binPaths": [
+        "wezterm-gui.exe",
+        "WindowsTerminal.exe"
+      ],
+      "installHint": "Place a portable terminal under apps/terminal."
+    },
+    {
+      "name": "vscode",
+      "kind": "app",
+      "required": false,
+      "basePath": "apps/vscode",
+      "archiveName": "vscode-portable.zip",
+      "source": "drop-local-archive",
+      "binPaths": [
+        "Code.exe"
+      ],
+      "installHint": "Place VS Code portable files under apps/vscode."
+    },
+    {
+      "name": "codex",
+      "kind": "ai-cli",
+      "required": false,
+      "basePath": "tools/codex",
+      "archiveName": "codex-cli.zip",
+      "source": "drop-local-archive",
+      "wrapperPaths": [
+        "codex.cmd",
+        "codex.ps1"
+      ],
+      "binPaths": [
+        "codex-run.cmd",
+        "bin/codex.cmd",
+        "bin/codex.exe",
+        "node_modules/.bin/codex.cmd"
+      ],
+      "loginCheckArgs": [],
+      "loginCheckIndicatesAuth": false,
+      "loginArgs": [
+        "login"
+      ],
+      "installHint": "Place Codex CLI or a wrapper script under tools/codex."
+    },
+    {
+      "name": "gemini",
+      "kind": "ai-cli",
+      "required": false,
+      "basePath": "tools/gemini",
+      "archiveName": "gemini-cli.zip",
+      "source": "drop-local-archive",
+      "wrapperPaths": [
+        "gemini.cmd",
+        "gemini.ps1"
+      ],
+      "binPaths": [
+        "gemini-run.cmd",
+        "bin/gemini.cmd",
+        "bin/gemini.exe",
+        "node_modules/.bin/gemini.cmd"
+      ],
+      "portableValidationPaths": [
+        "node_modules/@google/gemini-cli/dist/index.js"
+      ],
+      "loginCheckArgs": [],
+      "loginCheckIndicatesAuth": false,
+      "loginArgs": [],
+      "installHint": "Place Gemini CLI or a wrapper script under tools/gemini."
+    },
+    {
+      "name": "iflow",
+      "kind": "ai-cli",
+      "required": false,
+      "basePath": "tools/iflow",
+      "archiveName": "",
+      "source": "npm",
+      "wrapperPaths": [
+        "iflow.cmd",
+        "iflow.ps1"
+      ],
+      "binPaths": [
+        "iflow-run.cmd",
+        "node_modules/.bin/iflow.cmd",
+        "node_modules/.bin/iflow"
+      ],
+      "loginCheckArgs": [],
+      "loginCheckIndicatesAuth": false,
+      "loginArgs": [],
+      "installHint": "Install iFlow CLI into tools/iflow or place a wrapper script there."
+    }
+  ]
+}

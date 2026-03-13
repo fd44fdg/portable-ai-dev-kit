@@ -1,0 +1,10 @@
+$script:PortableKitConfig = @{
+    WorkspacePath = 'workspace'
+    PreferredEditor = 'vscode'
+    PreferredTerminal = 'terminal'
+    AutoOpenWorkspace = $true
+    ShowAiHealthOnStart = $true
+    AdditionalPaths = @(
+        # 'custom\\bin'
+    )
+}
