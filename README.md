@@ -86,9 +86,9 @@ Ignored locally:
 
 ## Documentation
 
-- [Architecture](/F:/docs/architecture.md)
-- [Publishing Checklist](/F:/docs/publishing-checklist.md)
+- [Architecture](docs/architecture.md)
+- [Publishing Checklist](docs/publishing-checklist.md)
 
 ## License
 
-[MIT](/F:/LICENSE)
+[MIT](LICENSE)
