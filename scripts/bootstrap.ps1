@@ -29,15 +29,23 @@ function Open-PreferredApp {
     $terminal = $ToolStatus | Where-Object { $_.Name -eq $Config.PreferredTerminal } | Select-Object -First 1
 
     if ($Config.AutoOpenWorkspace -and $editor -and $editor.LaunchPath) {
-        Write-Host "Launching editor: $($editor.LaunchPath)" -ForegroundColor Green
-        Start-Process -FilePath $editor.LaunchPath -ArgumentList @($workspacePath) | Out-Null
-        return
+        try {
+            Start-Process -FilePath $editor.LaunchPath -ArgumentList @($workspacePath) -ErrorAction Stop
+            Write-Host "Launching editor: $($editor.LaunchPath)" -ForegroundColor Green
+            return
+        } catch {
+            Write-Host "Failed to launch editor: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 
     if ($terminal -and $terminal.LaunchPath) {
-        Write-Host "Launching terminal: $($terminal.LaunchPath)" -ForegroundColor Green
-        Start-Process -FilePath $terminal.LaunchPath -WorkingDirectory $workspacePath | Out-Null
-        return
+        try {
+            Start-Process -FilePath $terminal.LaunchPath -WorkingDirectory $workspacePath -ErrorAction Stop
+            Write-Host "Launching terminal: $($terminal.LaunchPath)" -ForegroundColor Green
+            return
+        } catch {
+            Write-Host "Failed to launch terminal: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 
     Write-Host "No preferred portable app found. Staying in PowerShell." -ForegroundColor Yellow

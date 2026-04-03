@@ -6,6 +6,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$runner = Join-Path -Path $PSScriptRoot -ChildPath 'gemini-run.cmd'
+$runner = Join-Path -Path $PSScriptRoot -ChildPath 'gemini-msys2.cmd'
 & $runner @Args
 exit $LASTEXITCODE

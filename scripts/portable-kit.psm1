@@ -66,6 +66,8 @@ function Get-PortableToolManifest {
     return Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 }
 
+$script:AddedPathEntries = @{}
+
 function Add-PortablePathEntry {
     param([string]$PathEntry)
 
@@ -73,14 +75,24 @@ function Add-PortablePathEntry {
         return
     }
 
-    if (-not (Test-Path -LiteralPath $PathEntry)) {
+    $normalizedPath = $PathEntry.TrimEnd('\')
+    if ($script:AddedPathEntries.ContainsKey($normalizedPath)) {
         return
     }
 
-    $current = $env:PATH -split ';'
-    if ($current -notcontains $PathEntry) {
-        $env:PATH = "$PathEntry;$env:PATH"
+    if (-not (Test-Path -LiteralPath $normalizedPath)) {
+        return
     }
+
+    $current = @($env:PATH -split ';' | ForEach-Object { $_.TrimEnd('\') })
+    if ($current -notcontains $normalizedPath) {
+        $env:PATH = "$normalizedPath;$env:PATH"
+        $script:AddedPathEntries[$normalizedPath] = $true
+    }
+}
+
+function Clear-PathCache {
+    $script:AddedPathEntries.Clear()
 }
 
 function Resolve-ManifestPath {
@@ -93,11 +105,26 @@ function Resolve-ManifestPath {
     return Join-Path -Path $Root -ChildPath $expanded
 }
 
+$script:NestedDirectoryCache = @{}
+
+function Clear-PortableCache {
+    $script:NestedDirectoryCache.Clear()
+}
+
+function Clear-PathCache {
+    $script:AddedPathEntries.Clear()
+}
+
 function Find-PortableToolPath {
     param(
         [string]$BasePath,
         [object]$RelativePaths
     )
+
+    if (-not $script:NestedDirectoryCache.ContainsKey($BasePath)) {
+        $script:NestedDirectoryCache[$BasePath] = @(Get-ChildItem -LiteralPath $BasePath -Directory -Force -ErrorAction SilentlyContinue)
+    }
+    $nestedDirectories = $script:NestedDirectoryCache[$BasePath]
 
     foreach ($relativePath in @($RelativePaths)) {
         if ([string]::IsNullOrWhiteSpace($relativePath)) {
@@ -109,7 +136,6 @@ function Find-PortableToolPath {
             return $candidate
         }
 
-        $nestedDirectories = @(Get-ChildItem -LiteralPath $BasePath -Directory -Force -ErrorAction SilentlyContinue)
         foreach ($nestedDirectory in $nestedDirectories) {
             $nestedCandidate = Join-Path -Path $nestedDirectory.FullName -ChildPath ($relativePath -replace '/', '\')
             if (Test-Path -LiteralPath $nestedCandidate) {
@@ -226,26 +252,6 @@ function Get-PortableAiStatus {
         return $state
     }
 
-    $originalErrorPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $exitCode = Invoke-PortableToolCommand -ToolStatus $ToolStatus -Arguments @($ToolStatus.LoginCheckArgs) -Root $ToolStatus.Root
-    } finally {
-        $ErrorActionPreference = $originalErrorPreference
-    }
-    if (-not $ToolStatus.LoginCheckIndicatesAuth) {
-        if ($exitCode -eq 0) {
-            $state.Summary = 'installed'
-        } else {
-            $state.Summary = 'broken'
-        }
-    } elseif ($exitCode -eq 0) {
-        $state.LoggedIn = $true
-        $state.Summary = 'ready'
-    } else {
-        $state.Summary = 'login-required'
-    }
-
     return $state
 }
 
@@ -298,8 +304,9 @@ function Set-PortableToolEnvironment {
         PORTABLEKIT_HOST_LOCALAPPDATA = [Environment]::GetEnvironmentVariable('LOCALAPPDATA')
     }
 
-    foreach ($path in $portableEnv.Values) {
-        Ensure-PortableKitDirectory -Path $path
+    $missingPaths = @($portableEnv.Values | Where-Object { -not (Test-Path -LiteralPath $_) })
+    foreach ($path in $missingPaths) {
+        $null = New-Item -ItemType Directory -Path $path -Force
     }
 
     $originalEnv = @{}
@@ -344,6 +351,36 @@ function Export-PortableBootstrapState {
     }
 
     $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+
+    $logDir = Split-Path -Path $StatePath -Parent
+    $maxLogFiles = 10
+    $maxLogSizeMB = 50
+
+    if (Test-Path -LiteralPath $logDir) {
+        $allFiles = Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue
+        $logFiles = @($allFiles | Where-Object { $_.Name -like '*.log' } | Sort-Object LastWriteTime -Descending)
+        
+        $totalSizeMB = 0
+        if ($logFiles.Count -gt 0) {
+            $totalSize = 0
+            foreach ($f in $logFiles) { $totalSize += $f.Length }
+            $totalSizeMB = [math]::Round($totalSize / 1MB, 2)
+        }
+
+        if ($logFiles.Count -gt $maxLogFiles) {
+            $toDelete = $logFiles | Select-Object -Skip $maxLogFiles
+            foreach ($f in $toDelete) {
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        if ($totalSizeMB -gt $maxLogSizeMB) {
+            $toDeleteSize = $logFiles | Select-Object -Skip 5
+            foreach ($f in $toDeleteSize) {
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Get-PortableJsonFile {
@@ -578,4 +615,10 @@ function Invoke-PortableToolCommand {
     }
 }
 
-Export-ModuleMember -Function Resolve-PortableKitRoot, Ensure-PortableKitDirectory, Get-PortableKitDefaultConfig, Import-PortableKitConfig, Get-PortableToolManifest, Add-PortablePathEntry, Resolve-ManifestPath, Get-PortableToolStatus, Get-PortableAiStatus, Export-PortableBootstrapState, Get-PortableJsonFile, Save-PortableDownload, Install-PortableArchive, Get-PortableNpmCommand, Install-PortableNpmPackage, Invoke-PortableToolCommand
+Export-ModuleMember -Function Resolve-PortableKitRoot, Ensure-PortableKitDirectory, `
+    Get-PortableKitDefaultConfig, Import-PortableKitConfig, Get-PortableToolManifest, `
+    Add-PortablePathEntry, Resolve-ManifestPath, Get-PortableToolStatus, Get-PortableAiStatus, `
+    Get-PortableToolWorkingDirectory, Set-PortableToolEnvironment, Restore-PortableToolEnvironment, `
+    Export-PortableBootstrapState, Get-PortableJsonFile, Save-PortableDownload, `
+    Install-PortableArchive, Get-PortableNpmCommand, Install-PortableNpmPackage, `
+    Invoke-PortableToolCommand, Clear-PortableCache, Clear-PathCache

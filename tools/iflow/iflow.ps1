@@ -6,8 +6,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-$usbRoot = Split-Path -Path (Split-Path -Path (Split-Path -Path $PSCommandPath -Parent) -Parent) -Parent
-$dispatcher = Join-Path -Path $usbRoot -ChildPath 'scripts\ai-tool.ps1'
-& $dispatcher -Tool 'iflow' -Action 'run' @Args
+$runner = Join-Path -Path $PSScriptRoot -ChildPath 'iflow-msys2.cmd'
+& $runner @Args
 exit $LASTEXITCODE

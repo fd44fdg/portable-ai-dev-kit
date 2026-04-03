@@ -8,6 +8,8 @@ param(
 
     [string]$UsbRoot,
 
+    [switch]$UseMsys2,
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Args
 )
@@ -103,12 +105,109 @@ switch ($Action) {
         exit $exitCode
     }
     'run' {
-        if (-not $toolStatus.BinPath) {
+        if (-not $toolStatus.BinPath -and -not $toolStatus.LaunchPath) {
             Write-Host "$Tool is not installed yet." -ForegroundColor Yellow
             Write-Host $toolStatus.InstallHint -ForegroundColor Yellow
             exit 1
         }
 
-        exit (Invoke-PortableToolCommand -ToolStatus $toolStatus -Arguments $Args -Root $root)
+        if ($UseMsys2) {
+            $msys2Path = Join-Path -Path $UsbRoot -ChildPath 'apps\msys64'
+            $bashExe = Join-Path -Path $msys2Path -ChildPath 'usr\bin\bash.exe'
+
+            if (-not (Test-Path $bashExe)) {
+                Write-Host "MSYS2 not found at $msys2Path" -ForegroundColor Red
+                Write-Host "Please install MSYS2 or use without -UseMsys2 flag" -ForegroundColor Yellow
+                exit 1
+            }
+
+            $msys2Bin = Join-Path -Path $msys2Path -ChildPath 'usr\bin'
+            $mingw64Bin = Join-Path -Path $msys2Path -ChildPath 'mingw64\bin'
+            $nodePath = Join-Path -Path $UsbRoot -ChildPath 'apps\node'
+            $nodeBinPath = if (Test-Path (Join-Path $nodePath 'node.exe')) { $nodePath } else { $null }
+            if ($nodeBinPath) {
+                $nodePathStr = "$nodeBinPath;"
+            } else {
+                $nodePathStr = ""
+            }
+            $stateRoot = Join-Path -Path $UsbRoot -ChildPath 'state'
+            $homeDir = Join-Path -Path $stateRoot -ChildPath 'home'
+            $toolPath = $toolStatus.BinPath
+
+            $linuxCwd = Get-Location | ForEach-Object {
+                $drive = $_.Drive.Name
+                $path = $_.Path.Substring(1).Replace('\', '/')
+                "/$drive$path"
+            }
+
+            if (-not (Test-Path $homeDir)) {
+                New-Item -ItemType Directory -Path $homeDir -Force | Out-Null
+            }
+
+            $envScript = @"
+export PATH="$msys2Bin;$nodePathStr$mingw64Bin;`$PATH"
+export HOME="$homeDir"
+export MSYSTEM=MINGW64
+export MSYS2_PATH_TYPE=unix
+export CHERE_INVOKING=1
+export TERM=vt100
+cd "$linuxCwd"
+"@
+
+            if ($toolPath -match '\.ps1$') {
+                $envScript += @"
+
+powershell.exe -ExecutionPolicy Bypass -File "$toolPath" $('$Args -join ''')
+"@
+            } elseif ($toolPath -match '\.cmd$') {
+                $envScript += @"
+
+cmd.exe /c "$toolPath" $('$Args -join ''')
+"@
+            } else {
+                $envScript += @"
+
+"$toolPath" $('$Args -join ''')
+"@
+            }
+
+            $tempScript = [System.IO.Path]::GetTempFileName() + '.sh'
+            Set-Content -Path $tempScript -Value $envScript -Encoding UTF8
+
+            try {
+                & $bashExe -l $tempScript
+                exit $LASTEXITCODE
+            } finally {
+                if (Test-Path $tempScript) {
+                    Remove-Item $tempScript -Force
+                }
+            }
+        }
+
+        if ($toolStatus.BinPath) {
+            exit (Invoke-PortableToolCommand -ToolStatus $toolStatus -Arguments $Args -Root $root)
+        }
+
+        if ($toolStatus.LaunchPath) {
+            $originalPath = $env:PATH
+            $workingDir = Get-PortableToolWorkingDirectory -ToolStatus $toolStatus -Root $root
+            $originalEnv = $null
+            if ($root) {
+                $originalEnv = Set-PortableToolEnvironment -Root $root
+            }
+            try {
+                Push-Location -LiteralPath $workingDir
+                & $toolStatus.LaunchPath @Args
+                exit $LASTEXITCODE
+            } finally {
+                Pop-Location
+                if ($originalEnv) {
+                    Restore-PortableToolEnvironment -OriginalEnv $originalEnv
+                }
+                $env:PATH = $originalPath
+            }
+        }
+
+        exit 1
     }
 }

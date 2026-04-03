@@ -22,6 +22,10 @@ tools/*/node_modules/
 tools/*/node_modules.partial-*/
 tools/*/.iflow/
 tools/*/bin/
+tools/*/.claude/
+tools/*/claw-code-main/
+tools/*/claw-code.zip
+tools/*/get-shit-done/
 
 # Keep wrapper/package metadata versionable
 !tools/*/.keep
@@ -34,3 +38,8 @@ tools/*/bin/
 # Python noise
 __pycache__/
 *.pyc
+
+# Root-level runtime
+.openclaude-profile.json
+package.json
+package-lock.json

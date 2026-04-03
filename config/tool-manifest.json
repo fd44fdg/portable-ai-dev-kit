@@ -28,6 +28,18 @@
       "installHint": "Place a portable Node.js distribution under apps/node."
     },
     {
+      "name": "bun",
+      "kind": "runtime",
+      "required": false,
+      "basePath": "apps/bun",
+      "archiveName": "bun-windows-x64.zip",
+      "source": "drop-local-archive",
+      "binPaths": [
+        "bun.exe"
+      ],
+      "installHint": "Place a portable Bun distribution under apps/bun."
+    },
+    {
       "name": "python",
       "kind": "runtime",
       "required": false,
@@ -133,6 +145,36 @@
       "loginCheckIndicatesAuth": false,
       "loginArgs": [],
       "installHint": "Install iFlow CLI into tools/iflow or place a wrapper script there."
+    },
+    {
+      "name": "msys2",
+      "kind": "runtime",
+      "required": false,
+      "basePath": "apps/msys64",
+      "archiveName": "msys2-portable.zip",
+      "source": "drop-local-archive",
+      "binPaths": [
+        "usr/bin/bash.exe",
+        "usr/bin/sh.exe"
+      ],
+      "installHint": "Place a portable MSYS2 distribution under apps/msys64."
+    },
+    {
+      "name": "openclaude",
+      "kind": "ai-cli",
+      "required": false,
+      "basePath": "tools/openclaude",
+      "archiveName": "",
+      "source": "npm",
+      "wrapperPaths": [
+        "openclaude.cmd"
+      ],
+      "binPaths": [],
+      "portableValidationPaths": [],
+      "loginCheckArgs": [],
+      "loginCheckIndicatesAuth": false,
+      "loginArgs": [],
+      "installHint": "Install OpenClaude CLI into tools/openclaude or place a wrapper script there."
     }
   ]
 }

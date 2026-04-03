@@ -7,6 +7,7 @@ param(
     [string]$NetworkMode = 'auto',
     [switch]$IncludeCodex,
     [switch]$IncludeGemini,
+    [switch]$IncludeOpenClaude,
     [switch]$Force,
     [switch]$DryRun,
     [switch]$NonInteractive
@@ -313,6 +314,7 @@ $shouldPromptProfile = (-not $NonInteractive) -and (-not $PSBoundParameters.Cont
 $shouldPromptNetwork = (-not $NonInteractive) -and (($NetworkMode -eq 'auto') -and (-not $PSBoundParameters.ContainsKey('NetworkMode')))
 $shouldPromptCodex = (-not $NonInteractive) -and (-not $PSBoundParameters.ContainsKey('IncludeCodex'))
 $shouldPromptGemini = (-not $NonInteractive) -and (-not $PSBoundParameters.ContainsKey('IncludeGemini'))
+$shouldPromptOpenClaude = (-not $NonInteractive) -and (-not $PSBoundParameters.ContainsKey('IncludeOpenClaude'))
 
 if ($shouldPromptNetwork) {
     Write-Section "Network Mode"
@@ -359,6 +361,10 @@ if ($shouldPromptGemini) {
     $IncludeGemini = Read-YesNoChoice -Prompt 'Install Gemini CLI too?' -DefaultValue $false
 }
 
+if ($shouldPromptOpenClaude) {
+    $IncludeOpenClaude = Read-YesNoChoice -Prompt 'Install OpenClaude CLI too?' -DefaultValue $false
+}
+
 $selectedTools = @($selectedProfile)
 if ($IncludeCodex -and $selectedTools -notcontains 'codex') {
     $selectedTools += 'codex'
@@ -366,6 +372,10 @@ if ($IncludeCodex -and $selectedTools -notcontains 'codex') {
 
 if ($IncludeGemini -and $selectedTools -notcontains 'gemini') {
     $selectedTools += 'gemini'
+}
+
+if ($IncludeOpenClaude -and $selectedTools -notcontains 'openclaude') {
+    $selectedTools += 'openclaude'
 }
 
 Write-Section "Portable AI Dev Kit Setup"

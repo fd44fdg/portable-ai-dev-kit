@@ -18,6 +18,8 @@ if (-not $UsbRoot) {
 $root = Resolve-PortableKitRoot -Path $UsbRoot
 $manifestPath = Join-Path -Path $root -ChildPath 'config\tool-manifest.json'
 $manifest = Get-PortableToolManifest -ManifestPath $manifestPath
+$packageSourcesPath = Join-Path -Path $root -ChildPath 'config\package-sources.json'
+$packageSources = Get-PortableJsonFile -Path $packageSourcesPath
 
 if ($ShowManifestOnly) {
     $manifest.tools | Format-Table name, kind, required, basePath, archiveName, source, installHint -AutoSize
@@ -55,9 +57,9 @@ if (-not (Test-Path -LiteralPath $destination)) {
 }
 
 $installerType = 'zip'
-$manifestInstallerType = $toolEntry.PSObject.Properties['installerType']
-if ($manifestInstallerType) {
-    $installerType = $manifestInstallerType.Value
+$packageEntry = $packageSources.packages.PSObject.Properties[$Tool]
+if ($packageEntry) {
+    $installerType = Get-ManifestPropertyValue -InputObject $packageEntry.Value -PropertyName 'installerType' -DefaultValue 'zip'
 }
 
 Install-PortableArchive -ArchivePath $ArchivePath -DestinationPath $destination -InstallerType $installerType -Force:$Force

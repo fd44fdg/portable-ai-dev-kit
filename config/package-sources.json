@@ -27,7 +27,8 @@
   },
   "optionalAiTools": [
     "codex",
-    "gemini"
+    "gemini",
+    "openclaude"
   ],
   "networkModes": {
     "global": {
@@ -60,6 +61,16 @@
         "china": "https://npmmirror.com/mirrors/node/v24.14.0/node-v24.14.0-win-x64.zip"
       },
       "archiveName": "node-v24.14.0-win-x64.zip",
+      "postInstall": []
+    },
+    "bun": {
+      "type": "archive",
+      "installerType": "zip",
+      "urls": {
+        "global": "https://github.com/oven-sh/bun/releases/download/bun-v1.3.11/bun-windows-x64.zip",
+        "china": "https://github.com/oven-sh/bun/releases/download/bun-v1.3.11/bun-windows-x64.zip"
+      },
+      "archiveName": "bun-windows-x64.zip",
       "postInstall": []
     },
     "python": {
@@ -113,6 +124,24 @@
     "iflow": {
       "type": "npm",
       "packageName": "@iflow-ai/iflow-cli@latest",
+      "dependsOn": [
+        "node"
+      ],
+      "postInstall": []
+    },
+    "msys2": {
+      "type": "archive",
+      "installerType": "zip",
+      "urls": {
+        "global": "https://github.com/msys2/msys2/releases/download/2025-04-22/msys2-x86_64-20250422.exe",
+        "china": "https://github.com/msys2/msys2/releases/download/2025-04-22/msys2-x86_64-20250422.exe"
+      },
+      "archiveName": "msys2-portable.zip",
+      "postInstall": []
+    },
+    "openclaude": {
+      "type": "npm",
+      "packageName": "@gitlawb/openclaude@latest",
       "dependsOn": [
         "node"
       ],
