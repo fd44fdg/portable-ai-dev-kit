@@ -456,22 +456,26 @@ fn spawn_terminal_command(
         return Err(AppError::Message(format!("{} 尚未安装", tool.name)));
     }
 
+    let workspace = if purpose == "运行" {
+        select_working_directory(app)?
+    } else {
+        app.path("workspace")
+    };
     let args = command
         .iter()
         .skip(1)
         .map(|arg| quote_cmd_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    let workspace = app.path("workspace");
+    let workspace_text = child_process_path(&workspace);
+    let exe_text = child_process_path(&exe);
     let mut cmd = Command::new("cmd.exe");
     cmd.arg("/K")
         .arg(format!(
             "cd /d \"{}\" && \"{}\" {}",
-            workspace.display(),
-            exe.display(),
-            args
+            workspace_text, exe_text, args
         ))
-        .current_dir(&workspace);
+        .current_dir(&workspace_text);
     apply_portable_env(app, &mut cmd);
     cmd.spawn().map_err(|error| {
         AppError::Message(format!(
@@ -480,6 +484,40 @@ fn spawn_terminal_command(
         ))
     })?;
     Ok(())
+}
+
+fn select_working_directory(app: &AppState) -> Result<PathBuf, AppError> {
+    let default = child_process_path(&app.path("workspace"));
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; \
+         $dialog.Description = '选择 AI 工具启动目录'; \
+         $dialog.SelectedPath = '{}'; \
+         if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ \
+             [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+             Write-Output $dialog.SelectedPath \
+         }}",
+        escape_single_quote(&default)
+    );
+    let output = Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-Sta")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .output()?;
+    let selected = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_matches('\u{feff}')
+        .to_string();
+    if output.status.success() && !selected.is_empty() {
+        Ok(PathBuf::from(selected))
+    } else {
+        Err(AppError::Message(
+            "已取消目录选择，未启动工具。".to_string(),
+        ))
+    }
 }
 
 fn install_tool(
@@ -725,18 +763,20 @@ fn detect_version(app: &AppState, tool: &ToolDefinition) -> Option<String> {
     if !exe.exists() {
         return None;
     }
-    let mut command = Command::new(exe);
+    let mut command = Command::new(child_process_path(&exe));
     for arg in tool.version_command.iter().skip(1) {
         command.arg(arg);
     }
-    command.current_dir(app.path(&tool.base_path));
+    command.current_dir(child_process_path(&app.path(&tool.base_path)));
     apply_portable_env(app, &mut command);
     command
         .output()
         .ok()
         .and_then(|output| {
             if output.status.success() {
-                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Some(if stdout.is_empty() { stderr } else { stdout })
             } else {
                 None
             }

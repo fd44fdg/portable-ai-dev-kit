@@ -234,7 +234,7 @@ function App() {
             <div className="actions">
               <button
                 className="primary"
-                disabled={busyTool === active.id}
+                disabled={busyTool === active.id || active.status === "ready"}
                 onClick={() => runAction("install_tool", active.id)}
               >
                 <Download size={17} /> 安装
