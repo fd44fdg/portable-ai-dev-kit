@@ -471,10 +471,7 @@ fn spawn_terminal_command(
     let exe_text = child_process_path(&exe);
     let mut cmd = Command::new("cmd.exe");
     cmd.arg("/K")
-        .arg(format!(
-            "cd /d \"{}\" && \"{}\" {}",
-            workspace_text, exe_text, args
-        ))
+        .arg(format!("call \"{}\" {}", exe_text, args))
         .current_dir(&workspace_text);
     apply_portable_env(app, &mut cmd);
     cmd.spawn().map_err(|error| {
@@ -488,30 +485,38 @@ fn spawn_terminal_command(
 
 fn select_working_directory(app: &AppState) -> Result<PathBuf, AppError> {
     let default = child_process_path(&app.path("workspace"));
+    let selection_file = app.path("state/selected-workdir.txt");
+    let selection_file_text = child_process_path(&selection_file);
+    let _ = fs::remove_file(&selection_file);
     let script = format!(
         "Add-Type -AssemblyName System.Windows.Forms; \
          $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; \
          $dialog.Description = '选择 AI 工具启动目录'; \
          $dialog.SelectedPath = '{}'; \
          if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ \
-             [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-             Write-Output $dialog.SelectedPath \
+             Set-Content -LiteralPath '{}' -Value $dialog.SelectedPath -Encoding UTF8 \
          }}",
-        escape_single_quote(&default)
+        escape_single_quote(&default),
+        escape_single_quote(&selection_file_text)
     );
-    let output = Command::new("powershell.exe")
+    let status = Command::new("powershell.exe")
         .arg("-NoProfile")
         .arg("-Sta")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-Command")
         .arg(script)
-        .output()?;
-    let selected = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .trim_matches('\u{feff}')
-        .to_string();
-    if output.status.success() && !selected.is_empty() {
+        .status()?;
+    let selected = if status.success() && selection_file.exists() {
+        fs::read_to_string(&selection_file)?
+            .trim()
+            .trim_matches('\u{feff}')
+            .to_string()
+    } else {
+        String::new()
+    };
+    let _ = fs::remove_file(&selection_file);
+    if !selected.is_empty() {
         Ok(PathBuf::from(selected))
     } else {
         Err(AppError::Message(

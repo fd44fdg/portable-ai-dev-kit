@@ -82,6 +82,7 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [activeTool, setActiveTool] = useState<string>("codex");
   const [busyTool, setBusyTool] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [logs, setLogs] = useState<string[]>(["正在启动便携环境控制台..."]);
   const [startupError, setStartupError] = useState<string | null>(null);
 
@@ -111,6 +112,18 @@ function App() {
     () => dashboard?.tools.find((tool) => tool.id === activeTool) ?? dashboard?.tools[0],
     [dashboard, activeTool],
   );
+
+  async function refreshDashboard() {
+    setRefreshing(true);
+    appendLog("正在刷新状态...");
+    try {
+      await load();
+    } catch (error) {
+      appendLog(String(error));
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   async function runAction(
     action: "install_tool" | "uninstall_tool" | "update_tool" | "launch_tool" | "login_tool",
@@ -189,8 +202,13 @@ function App() {
             <p className="eyebrow">网络模式：{networkModeText(dashboard.networkMode)}</p>
             <h2>{active.name}</h2>
           </div>
-          <button className="icon-button" onClick={() => load()} title="刷新状态">
-            <RefreshCw size={18} />
+          <button
+            className="icon-button"
+            disabled={refreshing}
+            onClick={refreshDashboard}
+            title="刷新状态"
+          >
+            <RefreshCw className={refreshing ? "spin" : undefined} size={18} />
           </button>
         </header>
 
