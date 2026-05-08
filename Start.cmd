@@ -1,14 +1,19 @@
 @echo off
 setlocal
-for %%I in ("%~dp0.") do set "USB_ROOT=%%~fI\"
+set "KIT_ROOT=%~dp0"
+set "PORTABLE_AI_KIT_ROOT=%KIT_ROOT:~0,-1%"
 
-powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%USB_ROOT%scripts\bootstrap.ps1" -UsbRoot "%USB_ROOT%" -EntryPoint Start
-set "EXIT_CODE=%ERRORLEVEL%"
-
-if not "%EXIT_CODE%"=="0" (
-    echo.
-    echo Bootstrap failed with exit code %EXIT_CODE%.
-    pause
+if exist "%KIT_ROOT%src-tauri\target\release\portable-ai-dev-kit.exe" (
+  start "" "%KIT_ROOT%src-tauri\target\release\portable-ai-dev-kit.exe"
+  exit /b 0
 )
 
-endlocal & exit /b %EXIT_CODE%
+if exist "%KIT_ROOT%node_modules\.bin\tauri.cmd" (
+  call "%KIT_ROOT%node_modules\.bin\tauri.cmd" dev
+  exit /b %ERRORLEVEL%
+)
+
+echo Portable AI Dev Kit 尚未完成构建或依赖安装。
+echo 请先运行: npm install
+echo 然后运行: npm run tauri:dev
+exit /b 1

@@ -1,180 +1,104 @@
 {
   "schemaVersion": 1,
+  "networkModes": {
+    "global": {
+      "npmRegistry": "https://registry.npmjs.org/",
+      "archiveSource": "global"
+    },
+    "china": {
+      "npmRegistry": "https://registry.npmmirror.com/",
+      "archiveSource": "china"
+    }
+  },
   "tools": [
     {
-      "name": "git",
-      "kind": "runtime",
-      "required": true,
-      "basePath": "apps/git",
-      "archiveName": "git-portable.zip",
-      "source": "drop-local-archive",
-      "binPaths": [
-        "mingw64/bin/git.exe",
-        "cmd/git.exe",
-        "bin/git.exe"
-      ],
-      "installHint": "Place a portable Git distribution under apps/git."
-    },
-    {
-      "name": "node",
+      "id": "node",
+      "name": "Node.js",
       "kind": "runtime",
       "required": true,
       "basePath": "apps/node",
-      "archiveName": "node-portable.zip",
-      "source": "drop-local-archive",
-      "binPaths": [
-        "node.exe"
-      ],
-      "installHint": "Place a portable Node.js distribution under apps/node."
+      "versionCommand": ["node.exe", "--version"],
+      "hostVersionCommand": ["node", "--version"],
+      "binPaths": ["node.exe"],
+      "install": {
+        "type": "archive",
+        "archiveName": "node-v24.11.1-win-x64.zip",
+        "installerType": "zip",
+        "urls": {
+          "global": "https://nodejs.org/dist/v24.11.1/node-v24.11.1-win-x64.zip",
+          "china": "https://npmmirror.com/mirrors/node/v24.11.1/node-v24.11.1-win-x64.zip"
+        }
+      }
     },
     {
-      "name": "bun",
+      "id": "git",
+      "name": "Git",
       "kind": "runtime",
-      "required": false,
-      "basePath": "apps/bun",
-      "archiveName": "bun-windows-x64.zip",
-      "source": "drop-local-archive",
-      "binPaths": [
-        "bun.exe"
-      ],
-      "installHint": "Place a portable Bun distribution under apps/bun."
+      "required": true,
+      "basePath": "apps/git",
+      "versionCommand": ["cmd/git.exe", "--version"],
+      "hostVersionCommand": ["git", "--version"],
+      "binPaths": ["cmd/git.exe", "mingw64/bin/git.exe", "bin/git.exe"],
+      "install": {
+        "type": "archive",
+        "archiveName": "mingit-2.53.0.2-64-bit.zip",
+        "installerType": "zip",
+        "urls": {
+          "global": "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/MinGit-2.53.0.2-64-bit.zip",
+          "china": "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/MinGit-2.53.0.2-64-bit.zip"
+        }
+      }
     },
     {
-      "name": "python",
-      "kind": "runtime",
-      "required": false,
-      "basePath": "apps/python",
-      "archiveName": "python-portable.zip",
-      "source": "drop-local-archive",
-      "binPaths": [
-        "python.exe"
-      ],
-      "installHint": "Place an embeddable or portable Python distribution under apps/python."
-    },
-    {
-      "name": "terminal",
-      "kind": "app",
-      "required": false,
-      "basePath": "apps/terminal",
-      "archiveName": "terminal-portable.zip",
-      "source": "drop-local-archive",
-      "binPaths": [
-        "wezterm-gui.exe",
-        "WindowsTerminal.exe"
-      ],
-      "installHint": "Place a portable terminal under apps/terminal."
-    },
-    {
-      "name": "vscode",
-      "kind": "app",
-      "required": false,
-      "basePath": "apps/vscode",
-      "archiveName": "vscode-portable.zip",
-      "source": "drop-local-archive",
-      "binPaths": [
-        "Code.exe"
-      ],
-      "installHint": "Place VS Code portable files under apps/vscode."
-    },
-    {
-      "name": "codex",
+      "id": "codex",
+      "name": "Codex CLI",
       "kind": "ai-cli",
       "required": false,
       "basePath": "tools/codex",
-      "archiveName": "codex-cli.zip",
-      "source": "drop-local-archive",
-      "wrapperPaths": [
-        "codex.cmd",
-        "codex.ps1"
-      ],
-      "binPaths": [
-        "codex-run.cmd",
-        "bin/codex.cmd",
-        "bin/codex.exe",
-        "node_modules/.bin/codex.cmd"
-      ],
-      "loginCheckArgs": [],
-      "loginCheckIndicatesAuth": false,
-      "loginArgs": [
-        "login"
-      ],
-      "installHint": "Place Codex CLI or a wrapper script under tools/codex."
+      "packageName": "@openai/codex@latest",
+      "versionCommand": ["node_modules/.bin/codex.cmd", "--version"],
+      "hostVersionCommand": ["codex", "--version"],
+      "binPaths": ["node_modules/.bin/codex.cmd", "bin/codex.cmd", "bin/codex.exe"],
+      "runCommand": ["node_modules/.bin/codex.cmd"],
+      "loginCommand": ["node_modules/.bin/codex.cmd", "login"],
+      "install": {
+        "type": "npm",
+        "dependsOn": ["node"]
+      }
     },
     {
-      "name": "gemini",
+      "id": "claude",
+      "name": "Claude Code",
+      "kind": "ai-cli",
+      "required": false,
+      "basePath": "tools/claude",
+      "packageName": "@anthropic-ai/claude-code@latest",
+      "versionCommand": ["node_modules/.bin/claude.cmd", "--version"],
+      "hostVersionCommand": ["claude", "--version"],
+      "binPaths": ["node_modules/.bin/claude.cmd"],
+      "runCommand": ["node_modules/.bin/claude.cmd"],
+      "loginCommand": ["node_modules/.bin/claude.cmd"],
+      "install": {
+        "type": "npm",
+        "dependsOn": ["node"]
+      }
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini CLI",
       "kind": "ai-cli",
       "required": false,
       "basePath": "tools/gemini",
-      "archiveName": "gemini-cli.zip",
-      "source": "drop-local-archive",
-      "wrapperPaths": [
-        "gemini.cmd",
-        "gemini.ps1"
-      ],
-      "binPaths": [
-        "gemini-run.cmd",
-        "bin/gemini.cmd",
-        "bin/gemini.exe",
-        "node_modules/.bin/gemini.cmd"
-      ],
-      "portableValidationPaths": [
-        "node_modules/@google/gemini-cli/dist/index.js"
-      ],
-      "loginCheckArgs": [],
-      "loginCheckIndicatesAuth": false,
-      "loginArgs": [],
-      "installHint": "Place Gemini CLI or a wrapper script under tools/gemini."
-    },
-    {
-      "name": "iflow",
-      "kind": "ai-cli",
-      "required": false,
-      "basePath": "tools/iflow",
-      "archiveName": "",
-      "source": "npm",
-      "wrapperPaths": [
-        "iflow.cmd",
-        "iflow.ps1"
-      ],
-      "binPaths": [
-        "iflow-run.cmd",
-        "node_modules/.bin/iflow.cmd",
-        "node_modules/.bin/iflow"
-      ],
-      "loginCheckArgs": [],
-      "loginCheckIndicatesAuth": false,
-      "loginArgs": [],
-      "installHint": "Install iFlow CLI into tools/iflow or place a wrapper script there."
-    },
-    {
-      "name": "msys2",
-      "kind": "runtime",
-      "required": false,
-      "basePath": "apps/msys64",
-      "archiveName": "msys2-portable.zip",
-      "source": "drop-local-archive",
-      "binPaths": [
-        "usr/bin/bash.exe",
-        "usr/bin/sh.exe"
-      ],
-      "installHint": "Place a portable MSYS2 distribution under apps/msys64."
-    },
-    {
-      "name": "openclaude",
-      "kind": "ai-cli",
-      "required": false,
-      "basePath": "tools/openclaude",
-      "archiveName": "",
-      "source": "npm",
-      "wrapperPaths": [
-        "openclaude.cmd"
-      ],
-      "binPaths": [],
-      "portableValidationPaths": [],
-      "loginCheckArgs": [],
-      "loginCheckIndicatesAuth": false,
-      "loginArgs": [],
-      "installHint": "Install OpenClaude CLI into tools/openclaude or place a wrapper script there."
+      "packageName": "@google/gemini-cli@latest",
+      "versionCommand": ["node_modules/.bin/gemini.cmd", "--version"],
+      "hostVersionCommand": ["gemini", "--version"],
+      "binPaths": ["node_modules/.bin/gemini.cmd"],
+      "runCommand": ["node_modules/.bin/gemini.cmd"],
+      "loginCommand": ["node_modules/.bin/gemini.cmd"],
+      "install": {
+        "type": "npm",
+        "dependsOn": ["node"]
+      }
     }
   ]
 }

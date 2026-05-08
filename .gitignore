@@ -1,45 +1,16 @@
-# OS and editor noise
-Thumbs.db
-Desktop.ini
-*.lnk
-System Volume Information/
-
-# Local configuration
-config/local.ps1
-
-# Runtime state and logs
-state/**
-!state/.keep
-logs/**
-cache/**
-workspace/**
-
-# Portable app installs and downloads
-apps/**
-
-# Tool runtime artifacts
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+apps/
+cache/
+logs/
+state/
+workspace/
 tools/*/node_modules/
-tools/*/node_modules.partial-*/
-tools/*/.iflow/
-tools/*/bin/
-tools/*/.claude/
-tools/*/claw-code-main/
-tools/*/claw-code.zip
-tools/*/get-shit-done/
-
-# Keep wrapper/package metadata versionable
-!tools/*/.keep
-!tools/*/*.cmd
-!tools/*/*.ps1
-!tools/*/*.mjs
-!tools/*/package.json
-!tools/*/package-lock.json
-
-# Python noise
-__pycache__/
-*.pyc
-
-# Root-level runtime
-.openclaude-profile.json
-package.json
-package-lock.json
+tools/*/package-lock.json
+tools/*/package.json
+config/local.json
+tasks/
+old-portable-ai-dev-kit/
+1.png
