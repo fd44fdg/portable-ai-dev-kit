@@ -518,7 +518,9 @@ fn install_npm_tool(
         .ok_or_else(|| AppError::Message(format!("{} 未配置 npm 包", tool.name)))?;
     let registry = resolve_registry(app, settings)?;
     let tool_root = app.path(&tool.base_path);
+    let npm_cache = app.path("cache/npm");
     fs::create_dir_all(&tool_root)?;
+    fs::create_dir_all(&npm_cache)?;
 
     if !tool_root.join("package.json").exists() {
         fs::write(
@@ -531,13 +533,15 @@ fn install_npm_tool(
     command
         .arg("install")
         .arg("--prefix")
-        .arg(&tool_root)
+        .arg(child_process_path(&tool_root))
         .arg(package_name)
         .arg("--no-fund")
         .arg("--no-audit")
+        .arg("--cache")
+        .arg(child_process_path(&npm_cache))
         .arg("--registry")
         .arg(&registry)
-        .current_dir(&tool_root);
+        .current_dir(child_process_path(&tool_root));
     apply_portable_env(app, &mut command);
     prepend_path(&mut command, &node_root);
 
@@ -601,7 +605,7 @@ fn install_archive_tool(
             .arg(format!(
                 "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
                 escape_single_quote(url),
-                escape_single_quote(&powershell_path(&download_path))
+                escape_single_quote(&child_process_path(&download_path))
             ));
         let output = download.output()?;
         if !output.status.success() {
@@ -630,8 +634,8 @@ fn install_archive_tool(
         .arg("-Command")
         .arg(format!(
             "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            escape_single_quote(&powershell_path(&download_path)),
-            escape_single_quote(&powershell_path(&destination))
+            escape_single_quote(&child_process_path(&download_path)),
+            escape_single_quote(&child_process_path(&destination))
         ));
     let output = expand.output()?;
     flatten_single_root(&destination)?;
@@ -911,7 +915,7 @@ fn display_path(path: &Path) -> String {
     }
 }
 
-fn powershell_path(path: &Path) -> String {
+fn child_process_path(path: &Path) -> String {
     display_path(path)
 }
 
@@ -929,18 +933,30 @@ fn find_manifest_root(path: &Path) -> Option<PathBuf> {
 
 fn apply_portable_env(app: &AppState, command: &mut Command) {
     command
-        .env("HOME", app.path("state/home"))
-        .env("USERPROFILE", app.path("state/home"))
-        .env("APPDATA", app.path("state/appdata"))
-        .env("LOCALAPPDATA", app.path("state/localappdata"))
-        .env("XDG_CONFIG_HOME", app.path("state/xdg/config"))
-        .env("XDG_CACHE_HOME", app.path("state/xdg/cache"))
-        .env("XDG_STATE_HOME", app.path("state/xdg/state"));
+        .env("HOME", child_process_path(&app.path("state/home")))
+        .env("USERPROFILE", child_process_path(&app.path("state/home")))
+        .env("APPDATA", child_process_path(&app.path("state/appdata")))
+        .env(
+            "LOCALAPPDATA",
+            child_process_path(&app.path("state/localappdata")),
+        )
+        .env(
+            "XDG_CONFIG_HOME",
+            child_process_path(&app.path("state/xdg/config")),
+        )
+        .env(
+            "XDG_CACHE_HOME",
+            child_process_path(&app.path("state/xdg/cache")),
+        )
+        .env(
+            "XDG_STATE_HOME",
+            child_process_path(&app.path("state/xdg/state")),
+        );
 }
 
 fn prepend_path(command: &mut Command, path: &Path) {
     let original = env::var("PATH").unwrap_or_default();
-    command.env("PATH", format!("{};{}", path.display(), original));
+    command.env("PATH", format!("{};{}", child_process_path(path), original));
 }
 
 fn command_output(output: &std::process::Output) -> String {
@@ -1099,9 +1115,12 @@ mod tests {
     }
 
     #[test]
-    fn powershell_path_removes_windows_extended_prefix() {
+    fn child_process_path_removes_windows_extended_prefix() {
         let path = PathBuf::from(r"\\?\F:\BXAI\cache\downloads\node.zip");
-        assert_eq!(powershell_path(&path), r"F:\BXAI\cache\downloads\node.zip");
+        assert_eq!(
+            child_process_path(&path),
+            r"F:\BXAI\cache\downloads\node.zip"
+        );
     }
 
     #[test]
