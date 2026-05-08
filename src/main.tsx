@@ -82,24 +82,30 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [activeTool, setActiveTool] = useState<string>("codex");
   const [busyTool, setBusyTool] = useState<string | null>(null);
-  const [log, setLog] = useState<string>("正在启动便携环境控制台...");
+  const [logs, setLogs] = useState<string[]>(["正在启动便携环境控制台..."]);
   const [startupError, setStartupError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
+  const appendLog = useCallback((message: string) => {
+    setLogs((current) => [...current, message].slice(-50));
+  }, []);
+
+  const load = useCallback(async (silent = false) => {
     setStartupError(null);
     const next = await invoke<Dashboard>("bootstrap");
     setDashboard(next);
     setActiveTool((current) => next.tools.some((tool) => tool.id === current) ? current : next.tools[0]?.id ?? "");
-    setLog(`已加载便携环境：${next.root}`);
-  }, []);
+    if (!silent) {
+      appendLog(`已加载便携环境：${next.root}`);
+    }
+  }, [appendLog]);
 
   useEffect(() => {
     load().catch((error) => {
       const message = String(error);
       setStartupError(message);
-      setLog(message);
+      appendLog(message);
     });
-  }, [load]);
+  }, [appendLog, load]);
 
   const active = useMemo(
     () => dashboard?.tools.find((tool) => tool.id === activeTool) ?? dashboard?.tools[0],
@@ -111,13 +117,13 @@ function App() {
     toolId: string,
   ) {
     setBusyTool(toolId);
-    setLog(`正在${actionLabel(action)}：${toolId}...`);
+    appendLog(`正在${actionLabel(action)}：${toolId}...`);
     try {
       const result = await invoke<ToolCommandResult>(action, { toolId });
-      setLog([result.message, result.output].filter(Boolean).join("\n\n"));
-      await load();
+      appendLog([result.message, result.output].filter(Boolean).join("\n\n"));
+      await load(true);
     } catch (error) {
-      setLog(String(error));
+      appendLog(String(error));
     } finally {
       setBusyTool(null);
     }
@@ -183,7 +189,7 @@ function App() {
             <p className="eyebrow">网络模式：{networkModeText(dashboard.networkMode)}</p>
             <h2>{active.name}</h2>
           </div>
-          <button className="icon-button" onClick={load} title="刷新状态">
+          <button className="icon-button" onClick={() => load()} title="刷新状态">
             <RefreshCw size={18} />
           </button>
         </header>
@@ -288,7 +294,7 @@ function App() {
             <span>操作日志</span>
             <ExternalLink size={16} />
           </div>
-          <pre>{log}</pre>
+          <pre>{logs.join("\n\n")}</pre>
         </section>
       </section>
     </main>

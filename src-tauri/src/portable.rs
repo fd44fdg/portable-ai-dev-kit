@@ -601,7 +601,7 @@ fn install_archive_tool(
             .arg(format!(
                 "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
                 escape_single_quote(url),
-                escape_single_quote(&download_path.display().to_string())
+                escape_single_quote(&powershell_path(&download_path))
             ));
         let output = download.output()?;
         if !output.status.success() {
@@ -630,8 +630,8 @@ fn install_archive_tool(
         .arg("-Command")
         .arg(format!(
             "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            escape_single_quote(&download_path.display().to_string()),
-            escape_single_quote(&destination.display().to_string())
+            escape_single_quote(&powershell_path(&download_path)),
+            escape_single_quote(&powershell_path(&destination))
         ));
     let output = expand.output()?;
     flatten_single_root(&destination)?;
@@ -911,6 +911,10 @@ fn display_path(path: &Path) -> String {
     }
 }
 
+fn powershell_path(path: &Path) -> String {
+    display_path(path)
+}
+
 fn find_manifest_root(path: &Path) -> Option<PathBuf> {
     let mut current = path.to_path_buf();
     loop {
@@ -1092,6 +1096,12 @@ mod tests {
     fn display_path_removes_windows_extended_prefix() {
         let path = PathBuf::from(r"\\?\E:\kit\config");
         assert_eq!(display_path(&path), r"E:\kit\config");
+    }
+
+    #[test]
+    fn powershell_path_removes_windows_extended_prefix() {
+        let path = PathBuf::from(r"\\?\F:\BXAI\cache\downloads\node.zip");
+        assert_eq!(powershell_path(&path), r"F:\BXAI\cache\downloads\node.zip");
     }
 
     #[test]
