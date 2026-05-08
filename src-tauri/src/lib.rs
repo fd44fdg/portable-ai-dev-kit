@@ -25,21 +25,18 @@ fn health() -> Result<HealthReport, AppError> {
 }
 
 #[tauri::command]
-fn install_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
-    let app = AppState::discover()?;
-    tool_action(&app, ToolActionRequest::new(tool_id, "install"))
+async fn install_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
+    run_tool_action(tool_id, "install").await
 }
 
 #[tauri::command]
-fn uninstall_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
-    let app = AppState::discover()?;
-    tool_action(&app, ToolActionRequest::new(tool_id, "uninstall"))
+async fn uninstall_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
+    run_tool_action(tool_id, "uninstall").await
 }
 
 #[tauri::command]
-fn update_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
-    let app = AppState::discover()?;
-    tool_action(&app, ToolActionRequest::new(tool_id, "update"))
+async fn update_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
+    run_tool_action(tool_id, "update").await
 }
 
 #[tauri::command]
@@ -52,6 +49,18 @@ fn launch_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
 fn login_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
     let app = AppState::discover()?;
     open_tool_login(&app, &tool_id)
+}
+
+async fn run_tool_action(
+    tool_id: String,
+    action: &'static str,
+) -> Result<ToolCommandResult, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app = AppState::discover()?;
+        tool_action(&app, ToolActionRequest::new(tool_id, action))
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("后台任务执行失败：{}", error)))?
 }
 
 pub fn run() {
