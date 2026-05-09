@@ -1,7 +1,7 @@
 :root {
   color: #edf7f6;
   background: #071414;
-  font-family: "Aptos", "Segoe UI", sans-serif;
+  font-family: "Aptos", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
   font-synthesis: none;
   text-rendering: geometricPrecision;
   letter-spacing: 0;
@@ -125,10 +125,27 @@ dt,
   background: rgba(3, 22, 21, 0.32);
 }
 
-.root-card strong,
+.root-card strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-tab span,
+dd,
+.check-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 dd,
 .check-row span {
   display: block;
+  line-height: 1.4;
+}
+
+.tool-tab span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -155,6 +172,18 @@ dd,
 .tool-tab:hover,
 .tool-tab.active {
   background: rgba(234, 254, 249, 0.12);
+}
+
+.add-tool-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  margin-top: 12px;
+  border-radius: 8px;
+  background: rgba(217, 246, 237, 0.16);
+  cursor: pointer;
 }
 
 .status-dot {
@@ -196,7 +225,10 @@ dd,
 }
 
 .icon-button,
-.actions button {
+.actions button,
+.inline-input button,
+.mode-switch button,
+.modal-action {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -288,7 +320,9 @@ dd {
   padding: 0 14px;
 }
 
-.actions .primary {
+.actions .primary,
+.modal-action.primary,
+.inline-input button {
   background: #d9f6ed;
   color: #07201d;
 }
@@ -385,9 +419,10 @@ pre {
   scrollbar-color: rgba(222, 247, 241, 0.38) rgba(222, 247, 241, 0.08);
   scrollbar-width: thin;
   color: #d8f3ee;
-  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-family: "Cascadia Mono", "Consolas", "Microsoft YaHei UI", monospace;
   font-size: 12px;
   line-height: 1.55;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
 
@@ -411,6 +446,105 @@ pre {
   max-width: 520px;
   margin-top: 6px;
   color: rgba(232, 249, 245, 0.66);
+  overflow-wrap: anywhere;
+}
+
+.modal-backdrop {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(2, 10, 10, 0.58);
+}
+
+.add-modal {
+  width: min(720px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  padding: 18px;
+  border-radius: 8px;
+  overflow-y: auto;
+}
+
+.mode-switch {
+  display: inline-flex;
+  gap: 6px;
+  margin: 18px 0;
+  padding: 4px;
+  border-radius: 8px;
+  background: rgba(1, 20, 19, 0.34);
+}
+
+.mode-switch button {
+  min-height: 34px;
+  padding: 0 12px;
+  background: transparent;
+}
+
+.mode-switch button.active {
+  background: rgba(217, 246, 237, 0.16);
+}
+
+.add-form {
+  display: grid;
+  gap: 12px;
+}
+
+.add-form label {
+  display: grid;
+  gap: 7px;
+  color: rgba(225, 242, 239, 0.72);
+  font-size: 13px;
+}
+
+.add-form input {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 11px;
+  border: 1px solid rgba(219, 249, 242, 0.14);
+  border-radius: 8px;
+  outline: 0;
+  background: rgba(1, 20, 19, 0.34);
+  color: #edf7f6;
+  font: inherit;
+}
+
+.inline-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.inline-input button,
+.modal-action {
+  gap: 8px;
+  padding: 0 14px;
+}
+
+.package-list {
+  display: grid;
+  gap: 8px;
+  max-height: 190px;
+  overflow-y: auto;
+  padding-right: 6px;
+}
+
+.package-list button {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(4, 18, 18, 0.24);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.package-list span {
+  color: rgba(225, 242, 239, 0.62);
+  font-size: 12px;
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 

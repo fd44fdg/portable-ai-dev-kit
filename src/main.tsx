@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -9,7 +9,9 @@ import {
   HardDrive,
   KeyRound,
   Play,
+  Plus,
   RefreshCw,
+  Search,
   ShieldCheck,
   Terminal,
   Trash2,
@@ -66,6 +68,19 @@ type ToolCommandResult = {
   output: string;
 };
 
+type NpmPackageCandidate = {
+  name: string;
+  version?: string;
+  description?: string;
+};
+
+type NpmPackageSuggestion = {
+  name: string;
+  version?: string;
+  binNames: string[];
+  description?: string;
+};
+
 const statusText: Record<ToolStatus, string> = {
   ready: "可用",
   missing: "未安装",
@@ -78,6 +93,9 @@ const kindText: Record<ToolKind, string> = {
   app: "应用",
 };
 
+const maxLogEntries = 60;
+const maxLogMessageChars = 12000;
+
 function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [activeTool, setActiveTool] = useState<string>("codex");
@@ -85,9 +103,23 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [logs, setLogs] = useState<string[]>(["正在启动便携环境控制台..."]);
   const [startupError, setStartupError] = useState<string | null>(null);
+  const [showAddTool, setShowAddTool] = useState(false);
+  const [addMode, setAddMode] = useState<"search" | "manual">("search");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<NpmPackageCandidate[]>([]);
+  const [selectedPackage, setSelectedPackage] = useState<NpmPackageSuggestion | null>(null);
+  const [customName, setCustomName] = useState("");
+  const [customBin, setCustomBin] = useState("");
+  const [manualName, setManualName] = useState("");
+  const [manualInstall, setManualInstall] = useState("");
+  const [manualRun, setManualRun] = useState("");
+  const [manualVersion, setManualVersion] = useState("");
+  const [manualLogin, setManualLogin] = useState("");
+  const didBootstrap = useRef(false);
+  const operationInFlight = useRef(false);
 
   const appendLog = useCallback((message: string) => {
-    setLogs((current) => [...current, message].slice(-50));
+    setLogs((current) => [...current, trimLogMessage(message)].slice(-maxLogEntries));
   }, []);
 
   const load = useCallback(async (silent = false) => {
@@ -101,6 +133,10 @@ function App() {
   }, [appendLog]);
 
   useEffect(() => {
+    if (didBootstrap.current) {
+      return;
+    }
+    didBootstrap.current = true;
     load().catch((error) => {
       const message = String(error);
       setStartupError(message);
@@ -114,6 +150,10 @@ function App() {
   );
 
   async function refreshDashboard() {
+    if (busyTool || operationInFlight.current) {
+      appendLog("当前已有操作在执行，请等待完成后再刷新。");
+      return;
+    }
     setRefreshing(true);
     appendLog("正在刷新状态...");
     try {
@@ -129,11 +169,106 @@ function App() {
     action: "install_tool" | "uninstall_tool" | "update_tool" | "launch_tool" | "login_tool",
     toolId: string,
   ) {
+    if (busyTool || operationInFlight.current) {
+      appendLog("当前已有操作在执行，请等待完成后再启动新操作。");
+      return;
+    }
+    operationInFlight.current = true;
     setBusyTool(toolId);
     appendLog(`正在${actionLabel(action)}：${toolId}...`);
     try {
       const result = await invoke<ToolCommandResult>(action, { toolId });
       appendLog([result.message, result.output].filter(Boolean).join("\n\n"));
+      await load(true);
+    } catch (error) {
+      appendLog(String(error));
+    } finally {
+      operationInFlight.current = false;
+      setBusyTool(null);
+    }
+  }
+
+  async function searchPackages() {
+    if (!searchQuery.trim()) {
+      appendLog("请输入 npm 包搜索关键词。");
+      return;
+    }
+    setBusyTool("custom-search");
+    appendLog(`正在搜索 npm 包：${searchQuery.trim()}...`);
+    try {
+      const results = await invoke<NpmPackageCandidate[]>("search_npm_packages", { query: searchQuery.trim() });
+      setSearchResults(results);
+      appendLog(`找到 ${results.length} 个候选包。`);
+    } catch (error) {
+      appendLog(String(error));
+    } finally {
+      setBusyTool(null);
+    }
+  }
+
+  async function selectPackage(packageName: string) {
+    setBusyTool("custom-search");
+    appendLog(`正在解析 npm 包：${packageName}...`);
+    try {
+      const suggestion = await invoke<NpmPackageSuggestion>("inspect_npm_package", { packageName });
+      setSelectedPackage(suggestion);
+      setCustomName(suggestion.name);
+      setCustomBin(suggestion.binNames[0] ?? "");
+      appendLog(`已解析 ${suggestion.name}，可执行入口：${suggestion.binNames.join(", ") || "未发现"}`);
+    } catch (error) {
+      appendLog(String(error));
+    } finally {
+      setBusyTool(null);
+    }
+  }
+
+  async function addNpmTool() {
+    if (!selectedPackage || !customName.trim() || !customBin.trim()) {
+      appendLog("请先选择 npm 包，并填写工具名称和 bin 名称。");
+      return;
+    }
+    setBusyTool("custom-add");
+    appendLog(`正在添加并安装：${customName.trim()}...`);
+    try {
+      const result = await invoke<ToolCommandResult>("add_custom_npm_tool", {
+        request: {
+          name: customName.trim(),
+          packageName: selectedPackage.name,
+          binName: customBin.trim(),
+          loginArgs: "",
+          installNow: true,
+        },
+      });
+      appendLog([result.message, result.output].filter(Boolean).join("\n\n"));
+      setShowAddTool(false);
+      await load(true);
+    } catch (error) {
+      appendLog(String(error));
+    } finally {
+      setBusyTool(null);
+    }
+  }
+
+  async function addManualTool() {
+    if (!manualName.trim() || !manualInstall.trim() || !manualRun.trim()) {
+      appendLog("手动添加需要填写名称、安装命令和启动命令。");
+      return;
+    }
+    setBusyTool("custom-add");
+    appendLog(`正在添加并安装：${manualName.trim()}...`);
+    try {
+      const result = await invoke<ToolCommandResult>("add_custom_command_tool", {
+        request: {
+          name: manualName.trim(),
+          installCommand: manualInstall.trim(),
+          runCommand: manualRun.trim(),
+          versionCommand: manualVersion.trim(),
+          loginCommand: manualLogin.trim(),
+          installNow: true,
+        },
+      });
+      appendLog([result.message, result.output].filter(Boolean).join("\n\n"));
+      setShowAddTool(false);
       await load(true);
     } catch (error) {
       appendLog(String(error));
@@ -191,6 +326,14 @@ function App() {
           ))}
         </nav>
 
+        <button
+          className="add-tool-button"
+          disabled={busyTool !== null}
+          onClick={() => setShowAddTool(true)}
+        >
+          <Plus size={16} /> 添加 AI 工具
+        </button>
+
         <a className="deerflow-badge" href="https://deerflow.tech" target="_blank" rel="noreferrer">
           Created By Deerflow
         </a>
@@ -204,7 +347,7 @@ function App() {
           </div>
           <button
             className="icon-button"
-            disabled={refreshing}
+            disabled={refreshing || busyTool !== null}
             onClick={refreshDashboard}
             title="刷新状态"
           >
@@ -252,32 +395,32 @@ function App() {
             <div className="actions">
               <button
                 className="primary"
-                disabled={busyTool === active.id || active.status === "ready"}
+                disabled={busyTool !== null || active.status === "ready"}
                 onClick={() => runAction("install_tool", active.id)}
               >
                 <Download size={17} /> 安装
               </button>
               <button
-                disabled={busyTool === active.id || active.status === "missing"}
+                disabled={busyTool !== null || active.status === "missing"}
                 onClick={() => runAction("update_tool", active.id)}
               >
                 <RefreshCw size={17} /> 更新
               </button>
               <button
-                disabled={busyTool === active.id || active.status === "missing" || active.kind !== "ai-cli"}
+                disabled={busyTool !== null || active.status === "missing" || active.kind !== "ai-cli"}
                 onClick={() => runAction("login_tool", active.id)}
               >
                 <KeyRound size={17} /> 登录
               </button>
               <button
-                disabled={busyTool === active.id || active.status === "missing" || active.kind !== "ai-cli"}
+                disabled={busyTool !== null || active.status === "missing" || active.kind !== "ai-cli"}
                 onClick={() => runAction("launch_tool", active.id)}
               >
                 <Play size={17} /> 运行
               </button>
               <button
                 className="danger"
-                disabled={busyTool === active.id || active.status === "missing"}
+                disabled={busyTool !== null || active.status === "missing"}
                 onClick={() => runAction("uninstall_tool", active.id)}
               >
                 <Trash2 size={17} /> 卸载
@@ -315,8 +458,104 @@ function App() {
           <pre>{logs.join("\n\n")}</pre>
         </section>
       </section>
+
+      {showAddTool && (
+        <div className="modal-backdrop">
+          <section className="add-modal glass-panel">
+            <div className="detail-head">
+              <div>
+                <p className="eyebrow">自定义工具</p>
+                <h3>添加 AI CLI</h3>
+              </div>
+              <button className="icon-button" onClick={() => setShowAddTool(false)} title="关闭">
+                <XCircle size={18} />
+              </button>
+            </div>
+
+            <div className="mode-switch">
+              <button className={addMode === "search" ? "active" : ""} onClick={() => setAddMode("search")}>
+                npm 搜索
+              </button>
+              <button className={addMode === "manual" ? "active" : ""} onClick={() => setAddMode("manual")}>
+                手动命令
+              </button>
+            </div>
+
+            {addMode === "search" ? (
+              <div className="add-form">
+                <label>
+                  <span>搜索关键词</span>
+                  <div className="inline-input">
+                    <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} />
+                    <button onClick={searchPackages} disabled={busyTool !== null}>
+                      <Search size={16} /> 搜索
+                    </button>
+                  </div>
+                </label>
+                <div className="package-list">
+                  {searchResults.map((item) => (
+                    <button key={item.name} onClick={() => selectPackage(item.name)}>
+                      <strong>{item.name}</strong>
+                      <span>{item.version ?? ""} {item.description ?? ""}</span>
+                    </button>
+                  ))}
+                </div>
+                <label>
+                  <span>工具名称</span>
+                  <input value={customName} onChange={(event) => setCustomName(event.target.value)} />
+                </label>
+                <label>
+                  <span>bin 名称</span>
+                  <input value={customBin} onChange={(event) => setCustomBin(event.target.value)} />
+                </label>
+                <button className="primary modal-action" onClick={addNpmTool} disabled={busyTool !== null}>
+                  <Download size={16} /> 添加并安装
+                </button>
+              </div>
+            ) : (
+              <div className="add-form">
+                <label>
+                  <span>工具名称</span>
+                  <input value={manualName} onChange={(event) => setManualName(event.target.value)} />
+                </label>
+                <label>
+                  <span>安装命令</span>
+                  <input value={manualInstall} onChange={(event) => setManualInstall(event.target.value)} />
+                </label>
+                <label>
+                  <span>启动命令</span>
+                  <input value={manualRun} onChange={(event) => setManualRun(event.target.value)} />
+                </label>
+                <label>
+                  <span>版本命令</span>
+                  <input value={manualVersion} onChange={(event) => setManualVersion(event.target.value)} />
+                </label>
+                <label>
+                  <span>登录命令</span>
+                  <input value={manualLogin} onChange={(event) => setManualLogin(event.target.value)} />
+                </label>
+                <button className="primary modal-action" onClick={addManualTool} disabled={busyTool !== null}>
+                  <Download size={16} /> 添加并安装
+                </button>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
     </main>
   );
+}
+
+function trimLogMessage(message: string) {
+  if (message.length <= maxLogMessageChars) {
+    return message;
+  }
+  const keep = Math.floor(maxLogMessageChars / 2);
+  return [
+    message.slice(0, keep),
+    `\n\n...日志过长，已截断 ${message.length - maxLogMessageChars} 个字符...\n\n`,
+    message.slice(-keep),
+  ].join("");
 }
 
 function HealthIcon({ summary }: { summary: HealthSummary }) {
