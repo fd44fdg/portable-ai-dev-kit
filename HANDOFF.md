@@ -2,7 +2,7 @@
 
 **项目**: Portable AI Dev Kit (Tauri + React + Rust)
 **最后会话日期**: 2026-05-22
-**最后 commit**: `0dff6c5`
+**最后 commit**: `f9cc628`
 
 ---
 
@@ -27,12 +27,18 @@
 
 ---
 
-## 已修复（最后一轮）
+## 已修复
 
 ### `0dff6c5` — Block path traversal in custom tool bin_name and tighten log spacing
 
 1. **路径逃逸漏洞** — `portable.rs::add_custom_tool` 现在拒绝 `bin_name` 含 `/ \ .. :`
 2. **日志面板拥挤** — `main.tsx::logText` 用 `\n` 替换 `\n\n`
+
+### `f9cc628` — Fix concurrency races and bootstrap_kit hot-path overhead
+
+3. **`save_state` 读写竞态** — `load_state` 现在也持 `STATE_LOCK`，消除 `rename` 期间读到空 state 的窗口
+4. **`.bat` 写入 TOCTOU** — `spawn_terminal_command` 和 `add_custom_tool` 改为直接 `fs::rename`（Windows 上是原子的 `MoveFileExW + MOVEFILE_REPLACE_EXISTING`），去掉 `exists → remove → rename` 三步
+5. **`bootstrap_kit` 缓存** — 用 `LazyLock<Mutex<HashSet<PathBuf>>>` 按 root 缓存，dashboard 刷新不再每次跑 14 次 `create_dir_all`
 
 ---
 
@@ -48,39 +54,23 @@
 
 按优先级排：
 
-### 🔴 高优先
-1. **`save_state` 并发竞态**
-   `portable.rs::save_state` 用全局 `STATE_LOCK: Mutex<()>` 保护写入，但 `load_state` 不持锁。读取过程中另一个 command 正在 `fs::rename` 临时文件 → `final_path` 可能短暂不存在，触发 `load_state` 走 `path.exists() == false` 路径返回空 state。修复：把读也纳入同一锁。
-
-2. **`.bat` 写入 TOCTOU**
-   `spawn_terminal_command` 写 `.bat` 时：
-   ```rust
-   fs::write(&bat_tmp, ...)?;
-   if bat_path.exists() { fs::remove_file(&bat_path)?; }
-   fs::rename(&bat_tmp, &bat_path)?;
-   ```
-   `exists()` → `remove_file` 之间另一进程可能删除文件，或在 `rename` 前另一进程已创建。Windows 上 `fs::rename` 在目标存在时会失败。修复：直接尝试 rename，失败时按 `AlreadyExists` 处理；或用 `ReplaceFileW` 语义。
-
-3. **`bootstrap_kit` 在每次 dashboard 刷新被调用**
-   `get_dashboard` → `bootstrap_kit` → `fs::create_dir_all` ×14 次。如果便携盘在网络驱动上会有可见延迟。优化：仅首次 discover 时调用。
-
 ### 🟡 中优先
-4. **modal 焦点陷阱缺失**
+1. **modal 焦点陷阱缺失**
    ESC 可关闭，但 Tab 键可以跳出 modal 进入背景内容；屏幕阅读器无 `role="dialog"` / `aria-modal="true"`；打开时焦点未自动给到第一个输入框（NPM tab 用 `autoFocus`，但切到 PowerShell tab 后焦点跳到新输入需手动管理）。
 
-5. **`prepend_portable_paths` 路径累积**
+2. **`prepend_portable_paths` 路径累积**
    每次调用都从 `env::var("PATH")` 读当前 PATH 并 prepend。Tauri 主进程 PATH 在 dev 模式可能已被 `npm run tauri:dev` 注入额外路径。多次 launch 会让 PATH 不断膨胀（实际不会，因为每次都是新 Command —— 但需确认无副作用）。
 
-6. **日志 ANSI 颜色码**
+3. **日志 ANSI 颜色码**
    `command_output` 直接拼接 stdout/stderr。npm/cargo 输出含 ANSI 颜色码 `\x1b[...m`，在 `<pre>` 中显示为乱码。建议过滤。
 
-7. **`MAX_LOG_ENTRIES = 80` 截断丢失上下文**
+4. **`MAX_LOG_ENTRIES = 80` 截断丢失上下文**
    长安装日志（npm 下载几百行）会被切到只剩 80 条。建议：合并多行单条；或允许"完整日志"按钮打开外部窗口。
 
 ### 🟢 低优先
-8. **i18n 硬编码中文** — 全部 UI 字符串中文写死。如要支持英文需提取。
-9. **`marketplace_tools` 列表硬编码** — 6 个工具写死在 Rust 代码。应移到 `config/marketplace.json` 或拉取远程 manifest。
-10. **`flatten_single_root` 已检查 symlink，但不检查归档内 zip slip** — `Expand-Archive` 已防 zip slip，但若以后改用别的解压方式需注意。
+5. **i18n 硬编码中文** — 全部 UI 字符串中文写死。如要支持英文需提取。
+6. **`marketplace_tools` 列表硬编码** — 6 个工具写死在 Rust 代码。应移到 `config/marketplace.json` 或拉取远程 manifest。
+7. **`flatten_single_root` 已检查 symlink，但不检查归档内 zip slip** — `Expand-Archive` 已防 zip slip，但若以后改用别的解压方式需注意。
 
 ---
 
