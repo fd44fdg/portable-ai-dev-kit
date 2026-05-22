@@ -1683,7 +1683,63 @@ fn prepend_portable_paths(app: &AppState, command: &mut Command) {
 fn command_output(output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    format!("{}{}", stdout, stderr).trim().to_string()
+    let combined = format!("{}{}", stdout, stderr);
+    strip_terminal_escapes(&combined).trim().to_string()
+}
+
+/// Remove ANSI escape sequences and stray carriage returns from captured
+/// child process output so the log panel renders cleanly. npm and cargo emit
+/// CSI color codes plus `\r`-based progress redraws that show up as mojibake
+/// in a `<pre>` element.
+fn strip_terminal_escapes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    // CSI: ESC [ <params> <final 0x40..=0x7E>
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                b']' => {
+                    // OSC: ESC ] <data> (BEL | ESC \)
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    // Other two-byte ESC sequences — drop both bytes.
+                    i += 2;
+                }
+            }
+        } else if b == b'\r' {
+            // Progress-bar redraws use lone \r; \r\n becomes \n.
+            i += 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    // ESC (0x1b) and \r (0x0d) are not valid UTF-8 continuation or leading
+    // bytes, so skipping them preserves multibyte char boundaries.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn quote_cmd_arg(input: &str) -> String {
@@ -2107,5 +2163,14 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         let found = find_manifest_root(&nested).unwrap();
         assert_eq!(found, temp.path());
+    }
+
+    #[test]
+    fn strip_terminal_escapes_removes_ansi_and_cr() {
+        // SGR color codes, an OSC title sequence, a stray ESC X, and a \r
+        // progress redraw — all should vanish, leaving Chinese chars intact.
+        let raw = "\u{1b}[32m installed\u{1b}[0m\r\nadded 5 packages\r\u{1b}]0;title\u{07}\u{1b}M中文";
+        let cleaned = strip_terminal_escapes(raw);
+        assert_eq!(cleaned, " installed\nadded 5 packages中文");
     }
 }

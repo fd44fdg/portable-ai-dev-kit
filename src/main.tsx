@@ -104,6 +104,64 @@ function nowStamp(): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/** Trap Tab navigation inside the returned ref'd element while `open` is true,
+ *  restore focus to whatever was focused before opening, and focus the first
+ *  focusable element if nothing inside already claimed focus (e.g. via autoFocus). */
+function useFocusTrap(open: boolean) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const node = ref.current;
+    if (!node) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+
+    const queryFocusables = () =>
+      Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetParent !== null || el === document.activeElement,
+      );
+
+    const initialFocusTimer = window.setTimeout(() => {
+      if (!node.contains(document.activeElement)) {
+        queryFocusables()[0]?.focus();
+      }
+    }, 0);
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const list = queryFocusables();
+      if (list.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = list[0];
+      const last = list[list.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey) {
+        if (active === first || !node.contains(active)) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !node.contains(active)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    node.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(initialFocusTimer);
+      node.removeEventListener("keydown", onKeyDown);
+      if (previouslyFocused && typeof previouslyFocused.focus === "function") {
+        previouslyFocused.focus();
+      }
+    };
+  }, [open]);
+  return ref;
+}
+
 const statusText: Record<ToolStatus, string> = {
   ready: "可用",
   missing: "未安装",
@@ -143,12 +201,14 @@ function App() {
   const [installType, setInstallType] = useState<"npm" | "powershell-script">("npm");
   const [customScriptUrl, setCustomScriptUrl] = useState<string>("");
   const [customBinName, setCustomBinName] = useState<string>("");
+  const addModalRef = useFocusTrap(showAddModal);
 
   const [showMarketplace, setShowMarketplace] = useState<boolean>(false);
   const [marketplaceTools, setMarketplaceTools] = useState<MarketplaceTool[]>([]);
   const [marketplaceLoading, setMarketplaceLoading] = useState<boolean>(false);
   const [marketplaceBusy, setMarketplaceBusy] = useState<string | null>(null);
   const [marketplaceSearch, setMarketplaceSearch] = useState<string>("");
+  const marketplaceModalRef = useFocusTrap(showMarketplace);
 
   const isMountedRef = useRef(true);
   const bootstrapStartedRef = useRef(false);
@@ -587,8 +647,15 @@ function App() {
 
       {showAddModal && (
         <div className="modal-overlay" onClick={() => setShowAddModal(false)}>
-          <div className="modal-content glass-panel" onClick={(e) => e.stopPropagation()}>
-            <h3>添加自定义 AI 工具</h3>
+          <div
+            className="modal-content glass-panel"
+            onClick={(e) => e.stopPropagation()}
+            ref={addModalRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-tool-modal-title"
+          >
+            <h3 id="add-tool-modal-title">添加自定义 AI 工具</h3>
             
             <div className="modal-tabs">
               <button
@@ -675,9 +742,16 @@ function App() {
 
       {showMarketplace && (
         <div className="modal-overlay" onClick={() => { setShowMarketplace(false); setMarketplaceSearch(""); }}>
-          <div className="modal-content marketplace-modal glass-panel" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="modal-content marketplace-modal glass-panel"
+            onClick={(e) => e.stopPropagation()}
+            ref={marketplaceModalRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="marketplace-modal-title"
+          >
             <div className="marketplace-topbar">
-              <h3>
+              <h3 id="marketplace-modal-title">
                 <Store size={20} />
                 工具市场
               </h3>
