@@ -1,15 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{LazyLock, Mutex},
 };
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 static STATE_LOCK: Mutex<()> = Mutex::new(());
+static BOOTSTRAPPED_ROOTS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 const MANIFEST_PATH: &str = "config/tool-manifest.json";
 const SETTINGS_PATH: &str = "config/app-settings.json";
@@ -284,6 +286,19 @@ impl ToolActionRequest {
 }
 
 pub fn bootstrap_kit(app: &AppState) -> Result<(), AppError> {
+    // Skip the 14 create_dir_all + state-file check if we've already
+    // bootstrapped this root in the current process. Dashboard refresh
+    // triggers bootstrap_kit every call, which is visibly slow on network
+    // drives.
+    {
+        let cache = BOOTSTRAPPED_ROOTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if cache.contains(&app.root) {
+            return Ok(());
+        }
+    }
+
     for relative in [
         "apps",
         "cache",
@@ -307,6 +322,11 @@ pub fn bootstrap_kit(app: &AppState) -> Result<(), AppError> {
     if !app.path(STATE_PATH).exists() {
         save_state(app, &ToolStateFile::default())?;
     }
+
+    BOOTSTRAPPED_ROOTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(app.root.clone());
 
     Ok(())
 }
@@ -562,12 +582,11 @@ fn spawn_terminal_command(
         args = args
     );
 
-    // Write batch file atomically.
+    // Write batch file atomically. fs::rename on Windows uses
+    // MOVEFILE_REPLACE_EXISTING, so we replace the live .bat in one syscall
+    // rather than exists/remove/rename (which has a TOCTOU window).
     let bat_tmp = app.path("state").join(format!("{}.tmp", &bat_name));
     fs::write(&bat_tmp, &bat_content)?;
-    if bat_path.exists() {
-        fs::remove_file(&bat_path)?;
-    }
     fs::rename(&bat_tmp, &bat_path)?;
 
     let exe_str = display_path(&exe);
@@ -1446,6 +1465,7 @@ fn sanitize_relative_path(value: &str, fallback: &str) -> String {
 }
 
 fn load_state(app: &AppState) -> Result<ToolStateFile, AppError> {
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = app.path(STATE_PATH);
     if !path.exists() {
         return Ok(ToolStateFile::default());
@@ -1473,9 +1493,9 @@ fn save_state(app: &AppState, state: &ToolStateFile) -> Result<(), AppError> {
     let temp_path = state_dir.join("tool-state.json.tmp");
     let serialized = serde_json::to_string_pretty(state)?;
     fs::write(&temp_path, serialized)?;
-    if final_path.exists() {
-        fs::remove_file(&final_path)?;
-    }
+    // fs::rename on Windows uses MoveFileExW with MOVEFILE_REPLACE_EXISTING,
+    // so we don't need (and shouldn't do) a separate exists/remove step —
+    // that creates a TOCTOU window where readers see no file.
     fs::rename(&temp_path, &final_path)?;
     Ok(())
 }
@@ -1965,14 +1985,13 @@ pub fn add_custom_tool(
 
     custom_file.tools.push(tool);
 
-    // Save custom tools atomically
+    // Save custom tools atomically. fs::rename on Windows uses
+    // MOVEFILE_REPLACE_EXISTING, so this single syscall replaces any
+    // existing file without a TOCTOU window.
     let config_dir = app.path("config");
     fs::create_dir_all(&config_dir)?;
     let temp_path = config_dir.join("custom-tools.json.tmp");
     fs::write(&temp_path, serde_json::to_string_pretty(&custom_file)?)?;
-    if custom_path.exists() {
-        fs::remove_file(&custom_path)?;
-    }
     fs::rename(&temp_path, &custom_path)?;
 
     Ok(new_tool_id)
