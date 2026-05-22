@@ -98,6 +98,8 @@ function extractErrorMessage(error: unknown): string {
 }
 
 type LogEntry = { ts: string; text: string };
+type ToastKind = "error" | "success" | "info";
+type Toast = { id: number; message: string; kind: ToastKind };
 const MAX_LOG_ENTRIES = 80;
 function nowStamp(): string {
   const d = new Date();
@@ -193,6 +195,35 @@ function App() {
     [logEntries],
   );
   const [startupError, setStartupError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
+
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const toastTimers = useRef<Map<number, number>>(new Map());
+  const dismissToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+    const handle = toastTimers.current.get(id);
+    if (handle !== undefined) {
+      window.clearTimeout(handle);
+      toastTimers.current.delete(id);
+    }
+  }, []);
+  const pushToast = useCallback(
+    (message: string, kind: ToastKind = "error") => {
+      if (!message) return;
+      const id = Date.now() + Math.floor(Math.random() * 1000);
+      setToasts((prev) => [...prev, { id, message, kind }]);
+      const handle = window.setTimeout(() => dismissToast(id), 3000);
+      toastTimers.current.set(id, handle);
+    },
+    [dismissToast],
+  );
+  useEffect(
+    () => () => {
+      toastTimers.current.forEach((handle) => window.clearTimeout(handle));
+      toastTimers.current.clear();
+    },
+    [],
+  );
 
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
   const [customName, setCustomName] = useState<string>("");
@@ -239,14 +270,20 @@ function App() {
   }, [load]);
 
   const refresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
     setLog("正在刷新状态...");
     try {
       await load(true, true);
       setLog("状态已刷新");
     } catch (error) {
-      setLog(`刷新失败: ${extractErrorMessage(error)}`);
+      const message = extractErrorMessage(error);
+      setLog(`刷新失败: ${message}`);
+      pushToast(`刷新失败: ${message}`, "error");
+    } finally {
+      if (isMountedRef.current) setRefreshing(false);
     }
-  }, [load]);
+  }, [load, refreshing]);
 
   const active = useMemo(
     () => dashboard?.tools.find((tool) => tool.id === activeTool) ?? dashboard?.tools[0],
@@ -281,7 +318,7 @@ function App() {
       if (combined) setLog(combined);
       await load(true);
     } catch (error) {
-      if (isMountedRef.current) setLog(extractErrorMessage(error));
+      if (isMountedRef.current) { const message = extractErrorMessage(error); setLog(message); pushToast(message, "error"); }
     } finally {
       runActionInFlightRef.current = false;
       if (isMountedRef.current) setBusyTool(null);
@@ -320,7 +357,7 @@ function App() {
       if (!isMountedRef.current) return;
       setMarketplaceTools(tools);
     } catch (error) {
-      if (isMountedRef.current) setLog(extractErrorMessage(error));
+      if (isMountedRef.current) { const message = extractErrorMessage(error); setLog(message); pushToast(message, "error"); }
     } finally {
       if (isMountedRef.current) setMarketplaceLoading(false);
     }
@@ -348,7 +385,7 @@ function App() {
       setMarketplaceTools(tools);
       await load(true);
     } catch (error) {
-      if (isMountedRef.current) setLog(extractErrorMessage(error));
+      if (isMountedRef.current) { const message = extractErrorMessage(error); setLog(message); pushToast(message, "error"); }
     } finally {
       if (isMountedRef.current) setMarketplaceBusy(null);
     }
@@ -503,8 +540,14 @@ function App() {
             <p className="eyebrow">网络模式：{networkModeText(dashboard.networkMode)}</p>
             <h2>{active.name}</h2>
           </div>
-          <button className="icon-button" onClick={refresh} title="刷新状态">
-            <RefreshCw size={18} />
+          <button
+            className="icon-button"
+            onClick={refresh}
+            title="刷新状态"
+            disabled={refreshing}
+            aria-busy={refreshing}
+          >
+            <RefreshCw size={18} className={refreshing ? "spin" : undefined} />
           </button>
         </header>
 
@@ -515,7 +558,12 @@ function App() {
                 <p className="eyebrow">{kindText[active.kind]}</p>
                 <h3>{active.name}</h3>
               </div>
-              <span className={`pill ${active.status}`}>{statusText[active.status]}</span>
+              <span
+                key={`${active.id}-${active.status}`}
+                className={`pill ${active.status}`}
+              >
+                {statusText[active.status]}
+              </span>
             </div>
 
             <dl className="facts">
@@ -602,7 +650,7 @@ function App() {
                       setActiveTool(nextDashboard.tools[0]?.id ?? "");
                       setLog(`已成功删除自定义工具：${active.name}`);
                     } catch (error) {
-                      if (isMountedRef.current) setLog(extractErrorMessage(error));
+                      if (isMountedRef.current) { const message = extractErrorMessage(error); setLog(message); pushToast(message, "error"); }
                     } finally {
                       if (isMountedRef.current) setBusyTool(null);
                     }
@@ -837,6 +885,24 @@ function App() {
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {toasts.length > 0 && (
+        <div className="toast-stack" role="region" aria-label="通知" aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} className={`toast toast-${toast.kind}`} role="alert">
+              <span className="toast-message">{toast.message}</span>
+              <button
+                type="button"
+                className="toast-close"
+                aria-label="关闭通知"
+                onClick={() => dismissToast(toast.id)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ))}
         </div>
       )}
     </main>
