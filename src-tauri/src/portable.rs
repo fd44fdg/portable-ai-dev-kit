@@ -1878,6 +1878,19 @@ pub fn add_custom_tool(
         }
 
         let actual_bin = bin_name.unwrap_or_default().trim().to_string();
+        // Reject any path-like component to prevent the binary entry from
+        // escaping the tool base directory via resolve_tool_relative. The
+        // executable must be a single filename — no separators, no parent
+        // refs, no drive letters.
+        if actual_bin.contains('/')
+            || actual_bin.contains('\\')
+            || actual_bin.contains("..")
+            || actual_bin.contains(':')
+        {
+            return Err(AppError::Message(
+                "可执行文件名不能包含路径分隔符或上级目录引用".to_string(),
+            ));
+        }
         let actual_bin = if actual_bin.is_empty() {
             format!("{}.exe", id_name)
         } else if !actual_bin.to_lowercase().ends_with(".exe")

@@ -131,7 +131,7 @@ function App() {
     });
   }, []);
   const logText = useMemo(
-    () => logEntries.map((entry) => `[${entry.ts}] ${entry.text}`).join("\n\n"),
+    () => logEntries.map((entry) => `[${entry.ts}] ${entry.text}`).join("\n"),
     [logEntries],
   );
   const [startupError, setStartupError] = useState<string | null>(null);
