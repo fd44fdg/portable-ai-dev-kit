@@ -13,8 +13,10 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
+  Store,
   Terminal,
   Trash2,
+  X,
   XCircle,
 } from "lucide-react";
 import "./styles.css";
@@ -68,17 +70,15 @@ type ToolCommandResult = {
   output: string;
 };
 
-type NpmPackageCandidate = {
+type MarketplaceTool = {
+  id: string;
   name: string;
-  version?: string;
-  description?: string;
-};
-
-type NpmPackageSuggestion = {
-  name: string;
-  version?: string;
-  binNames: string[];
-  description?: string;
+  description: string;
+  packageName: string;
+  category: string;
+  homepage: string;
+  inManifest: boolean;
+  installed: boolean;
 };
 
 const statusText: Record<ToolStatus, string> = {
@@ -93,187 +93,209 @@ const kindText: Record<ToolKind, string> = {
   app: "应用",
 };
 
-const maxLogEntries = 60;
-const maxLogMessageChars = 12000;
-
 function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
-  const [activeTool, setActiveTool] = useState<string>("codex");
+  const [activeTool, setActiveTool] = useState<string>("");
   const [busyTool, setBusyTool] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const [logs, setLogs] = useState<string[]>(["正在启动便携环境控制台..."]);
+  const [log, setLog] = useState<string>("正在启动便携环境控制台...");
   const [startupError, setStartupError] = useState<string | null>(null);
-  const [showAddTool, setShowAddTool] = useState(false);
-  const [addMode, setAddMode] = useState<"search" | "manual">("search");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<NpmPackageCandidate[]>([]);
-  const [selectedPackage, setSelectedPackage] = useState<NpmPackageSuggestion | null>(null);
-  const [customName, setCustomName] = useState("");
-  const [customBin, setCustomBin] = useState("");
-  const [manualName, setManualName] = useState("");
-  const [manualInstall, setManualInstall] = useState("");
-  const [manualRun, setManualRun] = useState("");
-  const [manualVersion, setManualVersion] = useState("");
-  const [manualLogin, setManualLogin] = useState("");
-  const didBootstrap = useRef(false);
-  const operationInFlight = useRef(false);
 
-  const appendLog = useCallback((message: string) => {
-    setLogs((current) => [...current, trimLogMessage(message)].slice(-maxLogEntries));
+  const [showAddModal, setShowAddModal] = useState<boolean>(false);
+  const [customName, setCustomName] = useState<string>("");
+  const [customPackage, setCustomPackage] = useState<string>("");
+  const [addError, setAddError] = useState<string | null>(null);
+  const [installType, setInstallType] = useState<"npm" | "powershell-script">("npm");
+  const [customScriptUrl, setCustomScriptUrl] = useState<string>("");
+  const [customBinName, setCustomBinName] = useState<string>("");
+
+  const [showMarketplace, setShowMarketplace] = useState<boolean>(false);
+  const [marketplaceTools, setMarketplaceTools] = useState<MarketplaceTool[]>([]);
+  const [marketplaceLoading, setMarketplaceLoading] = useState<boolean>(false);
+  const [marketplaceBusy, setMarketplaceBusy] = useState<string | null>(null);
+  const [marketplaceSearch, setMarketplaceSearch] = useState<string>("");
+
+  const isMountedRef = useRef(true);
+  const bootstrapStartedRef = useRef(false);
+  const runActionInFlightRef = useRef(false);
+  useEffect(() => {
+    return () => { isMountedRef.current = false; };
   }, []);
 
-  const load = useCallback(async (silent = false) => {
+  const load = useCallback(async (keepLog = false, force = false) => {
     setStartupError(null);
-    const next = await invoke<Dashboard>("bootstrap");
+    const next = await invoke<Dashboard>("bootstrap", { force });
     setDashboard(next);
     setActiveTool((current) => next.tools.some((tool) => tool.id === current) ? current : next.tools[0]?.id ?? "");
-    if (!silent) {
-      appendLog(`已加载便携环境：${next.root}`);
+    if (!keepLog) {
+      setLog(`已加载便携环境：${next.root}`);
     }
-  }, [appendLog]);
+  }, []);
 
   useEffect(() => {
-    if (didBootstrap.current) {
-      return;
-    }
-    didBootstrap.current = true;
-    load().catch((error) => {
+    if (bootstrapStartedRef.current) return;
+    bootstrapStartedRef.current = true;
+    load(false).catch((error) => {
+      if (!isMountedRef.current) return;
       const message = String(error);
       setStartupError(message);
-      appendLog(message);
+      setLog(message);
     });
-  }, [appendLog, load]);
+  }, [load]);
+
+  const refresh = useCallback(async () => {
+    setLog("正在刷新状态...");
+    try {
+      await load(true, true);
+      setLog("状态已刷新");
+    } catch (error) {
+      setLog(`刷新失败: ${String(error)}`);
+    }
+  }, [load]);
 
   const active = useMemo(
     () => dashboard?.tools.find((tool) => tool.id === activeTool) ?? dashboard?.tools[0],
     [dashboard, activeTool],
   );
 
-  async function refreshDashboard() {
-    if (busyTool || operationInFlight.current) {
-      appendLog("当前已有操作在执行，请等待完成后再刷新。");
-      return;
-    }
-    setRefreshing(true);
-    appendLog("正在刷新状态...");
-    try {
-      await load();
-    } catch (error) {
-      appendLog(String(error));
-    } finally {
-      setRefreshing(false);
-    }
-  }
-
-  async function runAction(
+  const runAction = useCallback(async (
     action: "install_tool" | "uninstall_tool" | "update_tool" | "launch_tool" | "login_tool",
     toolId: string,
-  ) {
-    if (busyTool || operationInFlight.current) {
-      appendLog("当前已有操作在执行，请等待完成后再启动新操作。");
-      return;
-    }
-    operationInFlight.current = true;
+  ) => {
+    if (runActionInFlightRef.current) return;
+    runActionInFlightRef.current = true;
     setBusyTool(toolId);
-    appendLog(`正在${actionLabel(action)}：${toolId}...`);
+    setLog(`正在${actionLabel(action)}：${toolId}...`);
     try {
-      const result = await invoke<ToolCommandResult>(action, { toolId });
-      appendLog([result.message, result.output].filter(Boolean).join("\n\n"));
+      const tool = dashboard?.tools.find((item) => item.id === toolId);
+      let workspaceDir: string | null = null;
+      if ((action === "launch_tool" || action === "login_tool") && tool?.kind === "ai-cli") {
+        workspaceDir = await invoke<string | null>("select_workspace_dialog");
+        if (workspaceDir === null || workspaceDir === undefined) {
+          if (isMountedRef.current) setLog("已取消操作");
+          return;
+        }
+      }
+      const args =
+        action === "launch_tool" || action === "login_tool"
+          ? { toolId, workspaceDir }
+          : { toolId };
+      const result = await invoke<ToolCommandResult>(action, args);
+      if (!isMountedRef.current) return;
+      setLog([result.message, result.output].filter(Boolean).join("\n\n"));
       await load(true);
     } catch (error) {
-      appendLog(String(error));
+      if (isMountedRef.current) setLog(String(error));
     } finally {
-      operationInFlight.current = false;
-      setBusyTool(null);
+      runActionInFlightRef.current = false;
+      if (isMountedRef.current) setBusyTool(null);
     }
-  }
+  }, [dashboard, load]);
 
-  async function searchPackages() {
-    if (!searchQuery.trim()) {
-      appendLog("请输入 npm 包搜索关键词。");
-      return;
-    }
-    setBusyTool("custom-search");
-    appendLog(`正在搜索 npm 包：${searchQuery.trim()}...`);
+  useEffect(() => {
+    if (!showAddModal && !showMarketplace) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (showAddModal) setShowAddModal(false);
+        if (showMarketplace) { setShowMarketplace(false); setMarketplaceSearch(""); }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showAddModal, showMarketplace]);
+
+  const filteredMarketplaceTools = useMemo(
+    () => marketplaceTools.filter(
+      (t) =>
+        !marketplaceSearch ||
+        t.name.toLowerCase().includes(marketplaceSearch.toLowerCase()) ||
+        t.description.toLowerCase().includes(marketplaceSearch.toLowerCase()),
+    ),
+    [marketplaceTools, marketplaceSearch],
+  );
+
+  async function openMarketplace() {
+    setShowMarketplace(true);
+    setMarketplaceSearch("");
+    setMarketplaceLoading(true);
     try {
-      const results = await invoke<NpmPackageCandidate[]>("search_npm_packages", { query: searchQuery.trim() });
-      setSearchResults(results);
-      appendLog(`找到 ${results.length} 个候选包。`);
+      const tools = await invoke<MarketplaceTool[]>("marketplace_tools");
+      setMarketplaceTools(tools);
     } catch (error) {
-      appendLog(String(error));
+      setLog(String(error));
     } finally {
-      setBusyTool(null);
+      setMarketplaceLoading(false);
     }
   }
 
-  async function selectPackage(packageName: string) {
-    setBusyTool("custom-search");
-    appendLog(`正在解析 npm 包：${packageName}...`);
+  async function handleMarketplaceInstall(tool: MarketplaceTool) {
+    setMarketplaceBusy(tool.id);
+    setLog(`正在从市场安装：${tool.name}...`);
     try {
-      const suggestion = await invoke<NpmPackageSuggestion>("inspect_npm_package", { packageName });
-      setSelectedPackage(suggestion);
-      setCustomName(suggestion.name);
-      setCustomBin(suggestion.binNames[0] ?? "");
-      appendLog(`已解析 ${suggestion.name}，可执行入口：${suggestion.binNames.join(", ") || "未发现"}`);
-    } catch (error) {
-      appendLog(String(error));
-    } finally {
-      setBusyTool(null);
-    }
-  }
-
-  async function addNpmTool() {
-    if (!selectedPackage || !customName.trim() || !customBin.trim()) {
-      appendLog("请先选择 npm 包，并填写工具名称和 bin 名称。");
-      return;
-    }
-    setBusyTool("custom-add");
-    appendLog(`正在添加并安装：${customName.trim()}...`);
-    try {
-      const result = await invoke<ToolCommandResult>("add_custom_npm_tool", {
-        request: {
-          name: customName.trim(),
-          packageName: selectedPackage.name,
-          binName: customBin.trim(),
-          loginArgs: "",
-          installNow: true,
-        },
+      const result = await invoke<ToolCommandResult>("install_marketplace_tool", {
+        id: tool.id,
+        name: tool.name,
+        packageName: tool.packageName,
       });
-      appendLog([result.message, result.output].filter(Boolean).join("\n\n"));
-      setShowAddTool(false);
+      setLog([result.message, result.output].filter(Boolean).join("\n\n"));
+      const tools = await invoke<MarketplaceTool[]>("marketplace_tools");
+      setMarketplaceTools(tools);
       await load(true);
     } catch (error) {
-      appendLog(String(error));
+      setLog(String(error));
     } finally {
-      setBusyTool(null);
+      setMarketplaceBusy(null);
     }
   }
 
-  async function addManualTool() {
-    if (!manualName.trim() || !manualInstall.trim() || !manualRun.trim()) {
-      appendLog("手动添加需要填写名称、安装命令和启动命令。");
-      return;
+  async function handleAddCustomTool(e: React.FormEvent) {
+    e.preventDefault();
+    let name = customName.trim();
+    
+    if (installType === "npm") {
+      if (!customPackage.trim()) {
+        setAddError("请输入 npm 包名");
+        return;
+      }
+      if (!name) {
+        name = customPackage.trim().split('/').pop()?.split('@')[0] || "custom-tool";
+      }
+    } else {
+      if (!customScriptUrl.trim()) {
+        setAddError("请输入 PowerShell 脚本 URL");
+        return;
+      }
+      if (!name) {
+        const parts = customScriptUrl.trim().split('/');
+        const last = parts[parts.length - 1];
+        name = last.split('.')[0] || "custom-script";
+        if (name.toLowerCase() === "install") {
+          name = parts[parts.length - 2] || "custom-script";
+        }
+      }
     }
-    setBusyTool("custom-add");
-    appendLog(`正在添加并安装：${manualName.trim()}...`);
+
+    setAddError(null);
     try {
-      const result = await invoke<ToolCommandResult>("add_custom_command_tool", {
-        request: {
-          name: manualName.trim(),
-          installCommand: manualInstall.trim(),
-          runCommand: manualRun.trim(),
-          versionCommand: manualVersion.trim(),
-          loginCommand: manualLogin.trim(),
-          installNow: true,
-        },
+      const nextDashboard = await invoke<Dashboard>("add_custom_tool", {
+        name,
+        installType,
+        packageName: installType === "npm" ? customPackage.trim() : null,
+        scriptUrl: installType === "powershell-script" ? customScriptUrl.trim() : null,
+        binName: installType === "powershell-script" ? customBinName.trim() || null : null,
       });
-      appendLog([result.message, result.output].filter(Boolean).join("\n\n"));
-      setShowAddTool(false);
-      await load(true);
+      setDashboard(nextDashboard);
+      const newToolId = `custom-${name.toLowerCase().replace(/[^a-z0-9-_]/g, "")}`;
+      if (nextDashboard.tools.some(t => t.id === newToolId)) {
+        setActiveTool(newToolId);
+      }
+      setShowAddModal(false);
+      setCustomName("");
+      setCustomPackage("");
+      setCustomScriptUrl("");
+      setCustomBinName("");
+      setLog(`已成功添加自定义工具：${name}`);
     } catch (error) {
-      appendLog(String(error));
-    } finally {
-      setBusyTool(null);
+      setAddError(String(error));
     }
   }
 
@@ -324,15 +346,15 @@ function App() {
               <small>{kindText[tool.kind]}</small>
             </button>
           ))}
+          <button className="add-tool-btn" onClick={() => { setShowAddModal(true); setAddError(null); }}>
+            <Plus size={16} />
+            添加自定义 AI 工具
+          </button>
+          <button className="add-tool-btn marketplace-btn" onClick={openMarketplace}>
+            <Store size={16} />
+            工具市场
+          </button>
         </nav>
-
-        <button
-          className="add-tool-button"
-          disabled={busyTool !== null}
-          onClick={() => setShowAddTool(true)}
-        >
-          <Plus size={16} /> 添加 AI 工具
-        </button>
 
         <a className="deerflow-badge" href="https://deerflow.tech" target="_blank" rel="noreferrer">
           Created By Deerflow
@@ -345,13 +367,8 @@ function App() {
             <p className="eyebrow">网络模式：{networkModeText(dashboard.networkMode)}</p>
             <h2>{active.name}</h2>
           </div>
-          <button
-            className="icon-button"
-            disabled={refreshing || busyTool !== null}
-            onClick={refreshDashboard}
-            title="刷新状态"
-          >
-            <RefreshCw className={refreshing ? "spin" : undefined} size={18} />
+          <button className="icon-button" onClick={refresh} title="刷新状态">
+            <RefreshCw size={18} />
           </button>
         </header>
 
@@ -395,36 +412,66 @@ function App() {
             <div className="actions">
               <button
                 className="primary"
-                disabled={busyTool !== null || active.status === "ready"}
+                disabled={busyTool === active.id}
                 onClick={() => runAction("install_tool", active.id)}
               >
                 <Download size={17} /> 安装
               </button>
               <button
-                disabled={busyTool !== null || active.status === "missing"}
+                disabled={busyTool === active.id || active.status === "missing"}
                 onClick={() => runAction("update_tool", active.id)}
               >
                 <RefreshCw size={17} /> 更新
               </button>
               <button
-                disabled={busyTool !== null || active.status === "missing" || active.kind !== "ai-cli"}
+                disabled={busyTool === active.id || active.status === "missing" || active.kind !== "ai-cli"}
                 onClick={() => runAction("login_tool", active.id)}
               >
                 <KeyRound size={17} /> 登录
               </button>
               <button
-                disabled={busyTool !== null || active.status === "missing" || active.kind !== "ai-cli"}
+                disabled={busyTool === active.id || active.status === "missing" || active.kind !== "ai-cli"}
                 onClick={() => runAction("launch_tool", active.id)}
               >
                 <Play size={17} /> 运行
               </button>
               <button
                 className="danger"
-                disabled={busyTool !== null || active.status === "missing"}
+                disabled={busyTool === active.id || active.status === "missing"}
                 onClick={() => runAction("uninstall_tool", active.id)}
               >
                 <Trash2 size={17} /> 卸载
               </button>
+              {active.id.startsWith("custom-") && (
+                <button
+                  className="danger"
+                  disabled={busyTool === active.id}
+                  onClick={async () => {
+                    let confirmed = false;
+                    try {
+                      confirmed = window.confirm(`确定要彻底删除自定义工具 "${active.name}" 吗？这也会自动物理清理其安装文件。`);
+                    } catch {
+                      confirmed = false;
+                    }
+                    if (!confirmed) return;
+                    setBusyTool(active.id);
+                    setLog(`正在删除自定义工具：${active.name}...`);
+                    try {
+                      const nextDashboard = await invoke<Dashboard>("delete_custom_tool", { toolId: active.id });
+                      if (!isMountedRef.current) return;
+                      setDashboard(nextDashboard);
+                      setActiveTool(nextDashboard.tools[0]?.id ?? "");
+                      setLog(`已成功删除自定义工具：${active.name}`);
+                    } catch (error) {
+                      if (isMountedRef.current) setLog(String(error));
+                    } finally {
+                      if (isMountedRef.current) setBusyTool(null);
+                    }
+                  }}
+                >
+                  <Trash2 size={17} /> 删除
+                </button>
+              )}
             </div>
           </article>
 
@@ -455,107 +502,192 @@ function App() {
             <span>操作日志</span>
             <ExternalLink size={16} />
           </div>
-          <pre>{logs.join("\n\n")}</pre>
+          <pre>{log}</pre>
         </section>
       </section>
 
-      {showAddTool && (
-        <div className="modal-backdrop">
-          <section className="add-modal glass-panel">
-            <div className="detail-head">
-              <div>
-                <p className="eyebrow">自定义工具</p>
-                <h3>添加 AI CLI</h3>
-              </div>
-              <button className="icon-button" onClick={() => setShowAddTool(false)} title="关闭">
-                <XCircle size={18} />
+      {showAddModal && (
+        <div className="modal-overlay" onClick={() => setShowAddModal(false)}>
+          <div className="modal-content glass-panel" onClick={(e) => e.stopPropagation()}>
+            <h3>添加自定义 AI 工具</h3>
+            
+            <div className="modal-tabs">
+              <button
+                type="button"
+                className={installType === "npm" ? "modal-tab active" : "modal-tab"}
+                onClick={() => { setInstallType("npm"); setAddError(null); }}
+              >
+                NPM 包
+              </button>
+              <button
+                type="button"
+                className={installType === "powershell-script" ? "modal-tab active" : "modal-tab"}
+                onClick={() => { setInstallType("powershell-script"); setAddError(null); }}
+              >
+                PowerShell 脚本
               </button>
             </div>
 
-            <div className="mode-switch">
-              <button className={addMode === "search" ? "active" : ""} onClick={() => setAddMode("search")}>
-                npm 搜索
-              </button>
-              <button className={addMode === "manual" ? "active" : ""} onClick={() => setAddMode("manual")}>
-                手动命令
-              </button>
-            </div>
-
-            {addMode === "search" ? (
-              <div className="add-form">
-                <label>
-                  <span>搜索关键词</span>
-                  <div className="inline-input">
-                    <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} />
-                    <button onClick={searchPackages} disabled={busyTool !== null}>
-                      <Search size={16} /> 搜索
-                    </button>
-                  </div>
-                </label>
-                <div className="package-list">
-                  {searchResults.map((item) => (
-                    <button key={item.name} onClick={() => selectPackage(item.name)}>
-                      <strong>{item.name}</strong>
-                      <span>{item.version ?? ""} {item.description ?? ""}</span>
-                    </button>
-                  ))}
+            <form onSubmit={handleAddCustomTool}>
+              {installType === "npm" ? (
+                <div className="form-group">
+                  <label>npm 包名 (例如: freebuff)</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. freebuff"
+                    value={customPackage}
+                    onChange={(e) => setCustomPackage(e.target.value)}
+                    autoFocus
+                  />
                 </div>
-                <label>
-                  <span>工具名称</span>
-                  <input value={customName} onChange={(event) => setCustomName(event.target.value)} />
-                </label>
-                <label>
-                  <span>bin 名称</span>
-                  <input value={customBin} onChange={(event) => setCustomBin(event.target.value)} />
-                </label>
-                <button className="primary modal-action" onClick={addNpmTool} disabled={busyTool !== null}>
-                  <Download size={16} /> 添加并安装
+              ) : (
+                <>
+                  <div className="form-group">
+                    <label>PowerShell 脚本 URL (安装脚本地址)</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="https://example.com/install.ps1"
+                      value={customScriptUrl}
+                      onChange={(e) => setCustomScriptUrl(e.target.value)}
+                      autoFocus
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label>可执行二进制文件名 (可选，例如: agy.exe)</label>
+                    <input
+                      type="text"
+                      placeholder="留空则自动从工具名称推断"
+                      value={customBinName}
+                      onChange={(e) => setCustomBinName(e.target.value)}
+                    />
+                  </div>
+                </>
+              )}
+              
+              <div className="form-group">
+                <label>工具名称 (可选，留空则自动推断)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Antigravity"
+                  value={customName}
+                  onChange={(e) => setCustomName(e.target.value)}
+                />
+              </div>
+
+              {addError && (
+                <div style={{ color: "#ffc2b9", fontSize: "13px", marginTop: "8px" }}>
+                  {addError}
+                </div>
+              )}
+              <div className="modal-actions">
+                <button type="button" className="btn-cancel" onClick={() => setShowAddModal(false)}>
+                  取消
                 </button>
+                <button type="submit" className="btn-confirm">
+                  确定
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showMarketplace && (
+        <div className="modal-overlay" onClick={() => { setShowMarketplace(false); setMarketplaceSearch(""); }}>
+          <div className="modal-content marketplace-modal glass-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="marketplace-topbar">
+              <h3>
+                <Store size={20} />
+                工具市场
+              </h3>
+              <div className="marketplace-search">
+                <Search size={16} />
+                <input
+                  type="text"
+                  placeholder="搜索工具..."
+                  value={marketplaceSearch}
+                  onChange={(e) => setMarketplaceSearch(e.target.value)}
+                />
+              </div>
+              <button
+                className="icon-button marketplace-close"
+                onClick={() => { setShowMarketplace(false); setMarketplaceSearch(""); }}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {marketplaceLoading ? (
+              <div className="marketplace-loading">
+                <Activity className="spin" size={24} />
+                <span>加载工具列表...</span>
+              </div>
+            ) : filteredMarketplaceTools.length === 0 ? (
+              <div className="marketplace-empty">
+                <Search size={32} />
+                <p>未找到匹配的工具</p>
               </div>
             ) : (
-              <div className="add-form">
-                <label>
-                  <span>工具名称</span>
-                  <input value={manualName} onChange={(event) => setManualName(event.target.value)} />
-                </label>
-                <label>
-                  <span>安装命令</span>
-                  <input value={manualInstall} onChange={(event) => setManualInstall(event.target.value)} />
-                </label>
-                <label>
-                  <span>启动命令</span>
-                  <input value={manualRun} onChange={(event) => setManualRun(event.target.value)} />
-                </label>
-                <label>
-                  <span>版本命令</span>
-                  <input value={manualVersion} onChange={(event) => setManualVersion(event.target.value)} />
-                </label>
-                <label>
-                  <span>登录命令</span>
-                  <input value={manualLogin} onChange={(event) => setManualLogin(event.target.value)} />
-                </label>
-                <button className="primary modal-action" onClick={addManualTool} disabled={busyTool !== null}>
-                  <Download size={16} /> 添加并安装
-                </button>
+              <div className="marketplace-grid">
+                {filteredMarketplaceTools.map((tool) => (
+                  <div className={`marketplace-card ${tool.installed ? "installed" : ""}`} key={tool.id}>
+                    <div className="marketplace-card-top">
+                      <div className="marketplace-card-icon">
+                        {tool.name.charAt(0).toUpperCase()}
+                      </div>
+                      <div className="marketplace-card-info">
+                        <h4>{tool.name}</h4>
+                        <span className="marketplace-category">{tool.category}</span>
+                      </div>
+                    </div>
+                    <p className="marketplace-desc">{tool.description}</p>
+                    <div className="marketplace-card-actions">
+                      <a
+                        href={tool.homepage}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="marketplace-link"
+                        title="访问主页"
+                      >
+                        <ExternalLink size={15} />
+                      </a>
+                      <div className="marketplace-card-buttons">
+                        {tool.inManifest && (
+                          <span className="marketplace-manifest-badge" title="此工具已在预设清单中，可在侧边栏管理">
+                            预设
+                          </span>
+                        )}
+                        {tool.installed ? (
+                          <span className="marketplace-installed-badge">
+                            <CheckCircle2 size={15} />
+                            已安装
+                          </span>
+                        ) : (
+                          <button
+                            className="primary"
+                            disabled={marketplaceBusy === tool.id}
+                            onClick={() => handleMarketplaceInstall(tool)}
+                          >
+                            {marketplaceBusy === tool.id ? (
+                              <><Activity className="spin" size={15} /> 安装中</>
+                            ) : (
+                              <><Download size={15} /> 安装</>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
-          </section>
+          </div>
         </div>
       )}
     </main>
   );
-}
-
-function trimLogMessage(message: string) {
-  if (message.length <= maxLogMessageChars) {
-    return message;
-  }
-  const keep = Math.floor(maxLogMessageChars / 2);
-  return [
-    message.slice(0, keep),
-    `\n\n...日志过长，已截断 ${message.length - maxLogMessageChars} 个字符...\n\n`,
-    message.slice(-keep),
-  ].join("");
 }
 
 function HealthIcon({ summary }: { summary: HealthSummary }) {

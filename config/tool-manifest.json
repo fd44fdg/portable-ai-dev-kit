@@ -84,20 +84,19 @@
       }
     },
     {
-      "id": "gemini",
-      "name": "Gemini CLI",
+      "id": "antigravity",
+      "name": "Antigravity CLI",
       "kind": "ai-cli",
       "required": false,
-      "basePath": "tools/gemini",
-      "packageName": "@google/gemini-cli@latest",
-      "versionCommand": ["node_modules/.bin/gemini.cmd", "--version"],
-      "hostVersionCommand": ["gemini", "--version"],
-      "binPaths": ["node_modules/.bin/gemini.cmd"],
-      "runCommand": ["node_modules/.bin/gemini.cmd"],
-      "loginCommand": ["node_modules/.bin/gemini.cmd"],
+      "basePath": "tools/antigravity",
+      "versionCommand": ["agy.exe", "--version"],
+      "hostVersionCommand": ["agy", "--version"],
+      "binPaths": ["agy.exe"],
+      "runCommand": ["agy.exe"],
+      "loginCommand": ["agy.exe", "login"],
       "install": {
-        "type": "npm",
-        "dependsOn": ["node"]
+        "type": "powershell-script",
+        "scriptUrl": "https://antigravity.google/cli/install.ps1"
       }
     }
   ]

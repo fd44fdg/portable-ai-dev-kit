@@ -1,17 +1,17 @@
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::{
     collections::BTreeMap,
     env, fs, io,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
 };
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+static STATE_LOCK: Mutex<()> = Mutex::new(());
+
 const MANIFEST_PATH: &str = "config/tool-manifest.json";
-const CUSTOM_TOOLS_PATH: &str = "config/custom-tools.json";
 const SETTINGS_PATH: &str = "config/app-settings.json";
 const STATE_PATH: &str = "state/tool-state.json";
 
@@ -47,25 +47,33 @@ impl AppState {
             });
         }
 
-        let candidates = [
+        let candidates: Vec<PathBuf> = [
             env::current_exe()
                 .ok()
                 .and_then(|path| path.parent().map(Path::to_path_buf)),
             env::current_dir().ok(),
-            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")),
-        ];
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
-        for candidate in candidates.into_iter().flatten() {
-            if let Some(root) = find_manifest_root(&candidate) {
+        for candidate in &candidates {
+            if let Some(root) = find_manifest_root(candidate) {
                 return Ok(Self {
                     root: normalize_path(root)?,
                 });
             }
         }
 
-        Ok(Self {
-            root: normalize_path(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."))?,
-        })
+        if let Some(first) = candidates.into_iter().next() {
+            return Ok(Self {
+                root: normalize_path(first)?,
+            });
+        }
+
+        Err(AppError::Message(
+            "无法定位便携根目录：未能读取可执行文件路径或当前目录".to_string(),
+        ))
     }
 
     pub fn path(&self, relative: &str) -> PathBuf {
@@ -84,7 +92,6 @@ pub struct Manifest {
 #[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomToolsFile {
-    #[serde(default)]
     pub tools: Vec<ToolDefinition>,
 }
 
@@ -134,9 +141,9 @@ pub struct InstallDefinition {
     pub depends_on: Vec<String>,
     pub archive_name: Option<String>,
     pub installer_type: Option<String>,
-    pub command: Option<String>,
     #[serde(default)]
     pub urls: BTreeMap<String, String>,
+    pub script_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -144,7 +151,7 @@ pub struct InstallDefinition {
 pub enum InstallType {
     Npm,
     Archive,
-    Command,
+    PowershellScript,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -176,6 +183,7 @@ pub struct ToolStateFile {
 #[serde(rename_all = "camelCase")]
 pub struct PersistedToolState {
     pub installed_version: Option<String>,
+    pub host_version: Option<String>,
     pub wanted_version: Option<String>,
     pub source: Option<String>,
     pub installed_at: Option<String>,
@@ -261,44 +269,6 @@ pub struct ToolCommandResult {
     pub output: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddNpmToolRequest {
-    pub name: String,
-    pub package_name: String,
-    pub bin_name: String,
-    pub login_args: Option<String>,
-    pub install_now: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddCommandToolRequest {
-    pub name: String,
-    pub install_command: String,
-    pub run_command: String,
-    pub version_command: Option<String>,
-    pub login_command: Option<String>,
-    pub install_now: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NpmPackageCandidate {
-    pub name: String,
-    pub version: Option<String>,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NpmPackageSuggestion {
-    pub name: String,
-    pub version: Option<String>,
-    pub bin_names: Vec<String>,
-    pub description: Option<String>,
-}
-
 pub struct ToolActionRequest {
     tool_id: String,
     action: String,
@@ -341,17 +311,19 @@ pub fn bootstrap_kit(app: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
-pub fn get_dashboard(app: &AppState) -> Result<Dashboard, AppError> {
+pub fn get_dashboard(app: &AppState, force: bool) -> Result<Dashboard, AppError> {
     bootstrap_kit(app)?;
     let manifest = load_manifest(app)?;
     let settings = load_settings(app)?;
-    let state = load_state(app)?;
+    let mut state = load_state(app)?;
     let tools = manifest
         .tools
         .iter()
-        .map(|tool| tool_view(app, tool, &state))
+        .map(|tool| tool_view(app, tool, &mut state, force))
         .collect::<Result<Vec<_>, _>>()?;
-    let health = check_health(app)?;
+    save_state(app, &state)?;
+    let health = check_health_with_state(app, &manifest, &settings, &mut state, false)?;
+    save_state(app, &state)?;
 
     Ok(Dashboard {
         root: display_path(&app.root),
@@ -365,7 +337,19 @@ pub fn get_dashboard(app: &AppState) -> Result<Dashboard, AppError> {
 pub fn check_health(app: &AppState) -> Result<HealthReport, AppError> {
     let manifest = load_manifest(app)?;
     let settings = load_settings(app)?;
-    let state = load_state(app)?;
+    let mut state = load_state(app)?;
+    let report = check_health_with_state(app, &manifest, &settings, &mut state, false)?;
+    save_state(app, &state)?;
+    Ok(report)
+}
+
+fn check_health_with_state(
+    app: &AppState,
+    manifest: &Manifest,
+    settings: &Settings,
+    state: &mut ToolStateFile,
+    force: bool,
+) -> Result<HealthReport, AppError> {
     let mut checks = Vec::new();
 
     push_path_check(&mut checks, "root", "环境根目录", &app.root, true);
@@ -402,7 +386,7 @@ pub fn check_health(app: &AppState) -> Result<HealthReport, AppError> {
     }
 
     for tool in &manifest.tools {
-        let view = tool_view(app, tool, &state)?;
+        let view = tool_view(app, tool, state, force)?;
         if tool.required && view.status != ToolStatus::Ready {
             let portability_note = if view.host_available {
                 "；宿主机已检测到，但尚未安装到当前移动盘"
@@ -447,7 +431,11 @@ pub fn tool_action(
     }
 }
 
-pub fn run_tool(app: &AppState, tool_id: &str) -> Result<ToolCommandResult, AppError> {
+pub fn run_tool(
+    app: &AppState,
+    tool_id: &str,
+    workspace_dir: Option<String>,
+) -> Result<ToolCommandResult, AppError> {
     bootstrap_kit(app)?;
     let manifest = load_manifest(app)?;
     let tool = find_tool(&manifest, tool_id)?;
@@ -460,18 +448,22 @@ pub fn run_tool(app: &AppState, tool_id: &str) -> Result<ToolCommandResult, AppE
         return Err(AppError::Message(format!("{} 未定义运行命令", tool.name)));
     }
 
-    spawn_terminal_command(app, tool, &command, "运行")?;
+    let output = spawn_terminal_command(app, tool, &command, "运行", workspace_dir)?;
 
     Ok(ToolCommandResult {
         tool_id: tool.id.clone(),
         action: "launch".to_string(),
         success: true,
         message: format!("已在新终端中启动 {}", tool.name),
-        output: String::new(),
+        output,
     })
 }
 
-pub fn login_tool(app: &AppState, tool_id: &str) -> Result<ToolCommandResult, AppError> {
+pub fn login_tool(
+    app: &AppState,
+    tool_id: &str,
+    workspace_dir: Option<String>,
+) -> Result<ToolCommandResult, AppError> {
     bootstrap_kit(app)?;
     let manifest = load_manifest(app)?;
     let tool = find_tool(&manifest, tool_id)?;
@@ -484,14 +476,14 @@ pub fn login_tool(app: &AppState, tool_id: &str) -> Result<ToolCommandResult, Ap
         return Err(AppError::Message(format!("{} 未定义登录命令", tool.name)));
     }
 
-    spawn_terminal_command(app, tool, &command, "登录")?;
+    let output = spawn_terminal_command(app, tool, &command, "登录", workspace_dir)?;
 
     Ok(ToolCommandResult {
         tool_id: tool.id.clone(),
         action: "login".to_string(),
         success: true,
         message: format!("已在新终端中打开 {} 登录流程", tool.name),
-        output: String::new(),
+        output,
     })
 }
 
@@ -500,102 +492,126 @@ fn spawn_terminal_command(
     tool: &ToolDefinition,
     command: &[String],
     purpose: &str,
-) -> Result<(), AppError> {
+    workspace_dir: Option<String>,
+) -> Result<String, AppError> {
     let exe = resolve_tool_relative(app, tool, &command[0]);
     if !exe.exists() {
         return Err(AppError::Message(format!("{} 尚未安装", tool.name)));
     }
 
-    let workspace = if purpose == "运行" {
-        select_working_directory(app)?
-    } else {
-        app.path("workspace")
-    };
-    let launcher = write_terminal_launcher(app, tool, &exe, command, purpose)?;
-    let workspace_text = child_process_path(&workspace);
-    let command_line = terminal_launcher_command_line(&launcher);
+    let args = command
+        .iter()
+        .skip(1)
+        .map(|arg| quote_cmd_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let workspace = workspace_dir
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| app.path("workspace"));
+    fs::create_dir_all(&workspace)?;
+    let workspace_str = display_path(&workspace);
+
+    // Path of the tool executable relative to the kit root, so the .bat
+    // resolves it from %KIT_ROOT% rather than a hard-coded drive letter.
+    let exe_rel_to_root = exe
+        .strip_prefix(&app.root)
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| display_path(&exe));
+
+    // Create the batch file launcher in state directory
+    let bat_name = format!("run_{}.bat", tool.id);
+    let bat_path = app.path("state").join(&bat_name);
+
+    // Generate batch file content.
+    //
+    // %~dp0 expands to the directory of this .bat ("<KIT_ROOT>\state\"),
+    // so "%~dp0.." is the kit root regardless of which drive the kit is
+    // currently mounted on. This keeps the launcher correct when the
+    // portable disk is plugged into a different machine with a new drive
+    // letter (or when the user manually double-clicks a stale .bat).
+    let bat_content = format!(
+        "@echo off\r\n\
+         chcp 65001 >nul\r\n\
+         setlocal\r\n\
+         pushd \"%~dp0..\" >nul\r\n\
+         set \"KIT_ROOT=%CD%\"\r\n\
+         popd >nul\r\n\
+         set \"HOME=%KIT_ROOT%\\state\\home\"\r\n\
+         set \"USERPROFILE=%KIT_ROOT%\\state\\home\"\r\n\
+         set \"APPDATA=%KIT_ROOT%\\state\\appdata\"\r\n\
+         set \"LOCALAPPDATA=%KIT_ROOT%\\state\\localappdata\"\r\n\
+         set \"XDG_CONFIG_HOME=%KIT_ROOT%\\state\\xdg\\config\"\r\n\
+         set \"XDG_CACHE_HOME=%KIT_ROOT%\\state\\xdg\\cache\"\r\n\
+         set \"XDG_STATE_HOME=%KIT_ROOT%\\state\\xdg\\state\"\r\n\
+         set \"XDG_DATA_HOME=%KIT_ROOT%\\state\\xdg\\data\"\r\n\
+         set \"TEMP=%KIT_ROOT%\\state\\temp\"\r\n\
+         set \"TMP=%KIT_ROOT%\\state\\temp\"\r\n\
+         set \"GIT_CONFIG_NOSYSTEM=1\"\r\n\
+         set \"NPM_CONFIG_CACHE=%KIT_ROOT%\\cache\\npm\"\r\n\
+         set \"NPM_CONFIG_PREFIX=%KIT_ROOT%\\apps\\node\"\r\n\
+         if not exist \"%TEMP%\" mkdir \"%TEMP%\" >nul 2>nul\r\n\
+         if not exist \"%NPM_CONFIG_CACHE%\" mkdir \"%NPM_CONFIG_CACHE%\" >nul 2>nul\r\n\
+         set \"PATH=%KIT_ROOT%\\apps\\node;%KIT_ROOT%\\apps\\git\\cmd;%KIT_ROOT%\\apps\\git\\bin;%KIT_ROOT%\\apps\\git\\mingw64\\bin;%PATH%\"\r\n\
+         cd /d \"{workspace}\"\r\n\
+         \"%KIT_ROOT%\\{exe_rel}\" {args}\r\n\
+         endlocal\r\n",
+        workspace = workspace_str,
+        exe_rel = exe_rel_to_root,
+        args = args
+    );
+
+    // Write batch file atomically.
+    let bat_tmp = app.path("state").join(format!("{}.tmp", &bat_name));
+    fs::write(&bat_tmp, &bat_content)?;
+    if bat_path.exists() {
+        fs::remove_file(&bat_path)?;
+    }
+    fs::rename(&bat_tmp, &bat_path)?;
+
+    let exe_str = display_path(&exe);
+    let log_name = format!("{}_{}.log", action_log_prefix(purpose), tool.id);
+    let log_path = app.path("logs").join(log_name);
+    let command_line = format!("\"{}\" {}", exe_str, args).trim().to_string();
+    let launch_details = format!(
+        "工具: {tool_name}\r\n\
+         动作: {purpose}\r\n\
+         工作目录: {workspace}\r\n\
+         可执行文件: {exe}\r\n\
+         参数: {args}\r\n\
+         命令行: {command_line}\r\n\
+         批处理文件: {bat_path}\r\n\
+         日志文件: {log_path}\r\n\r\n\
+         --- run bat ---\r\n{bat_content}",
+        tool_name = tool.name,
+        purpose = purpose,
+        workspace = workspace_str,
+        exe = exe_str,
+        args = args,
+        command_line = command_line,
+        bat_path = display_path(&bat_path),
+        log_path = display_path(&log_path),
+        bat_content = bat_content
+    );
+    fs::write(&log_path, &launch_details)?;
+
+    let bat_path_str = display_path(&bat_path);
     let mut cmd = Command::new("cmd.exe");
-    append_cmd_raw_args(&mut cmd, &command_line);
-    cmd.current_dir(&workspace_text);
+    cmd.arg("/K").arg(&bat_path_str).current_dir(&workspace_str);
     apply_portable_env(app, &mut cmd);
-    prepend_portable_tools_path(app, &mut cmd);
-    cmd.spawn().map_err(|error| {
+    prepend_portable_paths(app, &mut cmd);
+
+    // Detach child so its handle is not retained by us; we deliberately
+    // do not wait — cmd.exe /K is interactive and should outlive this call.
+    let child = cmd.spawn().map_err(|error| {
         AppError::Message(format!(
             "无法为 {} 打开 {} 终端：{}",
             tool.name, purpose, error
         ))
     })?;
-    Ok(())
-}
-
-fn write_terminal_launcher(
-    app: &AppState,
-    tool: &ToolDefinition,
-    exe: &Path,
-    command: &[String],
-    purpose: &str,
-) -> Result<PathBuf, AppError> {
-    let launcher_dir = app.path("state/launchers");
-    ensure_safe_child_path(app, &launcher_dir, "终端启动脚本目录")?;
-    fs::create_dir_all(&launcher_dir)?;
-    let launcher = launcher_dir.join(format!("{}-{}.cmd", tool.id, purpose));
-    let command_line = terminal_command_line(exe, command);
-    let content = format!(
-        "@echo off\r\n\
-         chcp 65001 >nul\r\n\
-         title {} - {}\r\n\
-         echo Starting {}...\r\n\
-         {}\r\n\
-         set \"__PAIDK_EXIT=%ERRORLEVEL%\"\r\n\
-         echo.\r\n\
-         echo {} exited with code %__PAIDK_EXIT%.\r\n\
-         echo This terminal is still using the selected workspace directory.\r\n",
-        tool.name, purpose, tool.name, command_line, tool.name
-    );
-    fs::write(&launcher, content)?;
-    Ok(launcher)
-}
-
-fn select_working_directory(app: &AppState) -> Result<PathBuf, AppError> {
-    let default = child_process_path(&app.path("workspace"));
-    let selection_file = app.path("state/selected-workdir.txt");
-    let selection_file_text = child_process_path(&selection_file);
-    let _ = fs::remove_file(&selection_file);
-    let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; \
-         $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; \
-         $dialog.Description = '选择 AI 工具启动目录'; \
-         $dialog.SelectedPath = '{}'; \
-         if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ \
-             Set-Content -LiteralPath '{}' -Value $dialog.SelectedPath -Encoding UTF8 \
-         }}",
-        escape_single_quote(&default),
-        escape_single_quote(&selection_file_text)
-    );
-    let status = Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-Sta")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .status()?;
-    let selected = if status.success() && selection_file.exists() {
-        fs::read_to_string(&selection_file)?
-            .trim()
-            .trim_matches('\u{feff}')
-            .to_string()
-    } else {
-        String::new()
-    };
-    let _ = fs::remove_file(&selection_file);
-    if !selected.is_empty() {
-        Ok(PathBuf::from(selected))
-    } else {
-        Err(AppError::Message(
-            "已取消目录选择，未启动工具。".to_string(),
-        ))
-    }
+    drop(child);
+    Ok(launch_details)
 }
 
 fn install_tool(
@@ -604,20 +620,22 @@ fn install_tool(
     settings: &Settings,
     tool: &ToolDefinition,
 ) -> Result<ToolCommandResult, AppError> {
+    let mut state = load_state(app)?;
     for dependency in &tool.install.depends_on {
         let dep = find_tool(manifest, dependency)?;
-        if tool_view(app, dep, &load_state(app)?)?.status != ToolStatus::Ready {
+        if tool_view(app, dep, &mut state, false)?.status != ToolStatus::Ready {
             return Err(AppError::Message(format!(
                 "{} 依赖 {}，请先安装依赖项。",
                 tool.name, dep.name
             )));
         }
     }
+    save_state(app, &state)?;
 
     match tool.install.install_type {
         InstallType::Npm => install_npm_tool(app, settings, tool),
         InstallType::Archive => install_archive_tool(app, manifest, settings, tool),
-        InstallType::Command => install_command_tool(app, tool),
+        InstallType::PowershellScript => install_powershell_script_tool(app, tool),
     }
 }
 
@@ -627,18 +645,15 @@ fn install_npm_tool(
     tool: &ToolDefinition,
 ) -> Result<ToolCommandResult, AppError> {
     let node_root = app.path("apps/node");
-    let npm = find_npm(app)?;
+    let npm = find_existing_path(&node_root, &["npm.cmd", "node_modules/npm/bin/npm-cli.js"])
+        .ok_or_else(|| AppError::Message("Node/npm 尚未安装".to_string()))?;
     let package_name = tool
         .package_name
         .as_ref()
         .ok_or_else(|| AppError::Message(format!("{} 未配置 npm 包", tool.name)))?;
     let registry = resolve_registry(app, settings)?;
     let tool_root = app.path(&tool.base_path);
-    let npm_cache = app.path("cache/npm");
-    ensure_safe_child_path(app, &tool_root, "工具安装目录")?;
-    ensure_safe_child_path(app, &npm_cache, "npm 缓存目录")?;
     fs::create_dir_all(&tool_root)?;
-    fs::create_dir_all(&npm_cache)?;
 
     if !tool_root.join("package.json").exists() {
         fs::write(
@@ -651,21 +666,27 @@ fn install_npm_tool(
     command
         .arg("install")
         .arg("--prefix")
-        .arg(child_process_path(&tool_root))
+        .arg(display_path(&tool_root))
         .arg(package_name)
         .arg("--no-fund")
         .arg("--no-audit")
-        .arg("--cache")
-        .arg(child_process_path(&npm_cache))
         .arg("--registry")
         .arg(&registry)
-        .current_dir(child_process_path(&tool_root));
+        .current_dir(display_path(&tool_root));
     apply_portable_env(app, &mut command);
     prepend_path(&mut command, &node_root);
 
     let output = command.output()?;
-    let combined = command_output(&output);
+    let mut combined = command_output(&output);
     let success = output.status.success();
+    if success && package_name == "freebuff" {
+        if let Some(patch_note) = patch_freebuff_index(app, tool)? {
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&patch_note);
+        }
+    }
     persist_action_state(
         app,
         tool,
@@ -685,6 +706,84 @@ fn install_npm_tool(
         },
         output: combined,
     })
+}
+
+fn patch_freebuff_index(app: &AppState, tool: &ToolDefinition) -> Result<Option<String>, AppError> {
+    let index_path = app
+        .path(&tool.base_path)
+        .join("node_modules/freebuff/index.js");
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&index_path)?;
+    if raw.contains("Portable AI Dev Kit stream patch") {
+        return Ok(Some(format!(
+            "freebuff stream pipeline patch already present: {}",
+            display_path(&index_path)
+        )));
+    }
+
+    let start = raw
+        .find("  res.on('data', (chunk) => {")
+        .ok_or_else(|| AppError::Message("无法定位 freebuff 下载进度代码".to_string()))?;
+    let end_marker =
+        "\n\n  const tempBinaryPath = path.join(CONFIG.tempDownloadDir, CONFIG.binaryName)";
+    let end = raw[start..]
+        .find(end_marker)
+        .map(|offset| start + offset)
+        .ok_or_else(|| AppError::Message("无法定位 freebuff 解压后续代码".to_string()))?;
+    let replacement = r#"  const ProgressTransform = require('stream').Transform
+  const progress = new ProgressTransform({
+    transform(chunk, _encoding, callback) {
+      downloadedSize += chunk.length
+      const now = Date.now()
+      if (now - lastProgressTime >= 100 || downloadedSize === totalSize) {
+        lastProgressTime = now
+        if (totalSize > 0) {
+          const pct = Math.round((downloadedSize / totalSize) * 100)
+          term.write(
+            `Downloading... ${createProgressBar(pct)} ${pct}% of ${formatBytes(
+              totalSize,
+            )}`,
+          )
+        } else {
+          term.write(`Downloading... ${formatBytes(downloadedSize)}`)
+        }
+      }
+      callback(null, chunk)
+    },
+  })
+
+  await new Promise((resolve, reject) => {
+    // Portable AI Dev Kit stream patch: attach the whole pipeline synchronously
+    // so the response cannot enter flowing mode before gunzip receives data.
+    const gunzip = zlib.createGunzip()
+    const extract = tar.x({ cwd: CONFIG.tempDownloadDir })
+    const fail = (error) => {
+      trackUpdateFailed(error.message, version, { stage: 'extraction' })
+      reject(error)
+    }
+
+    res.on('error', fail)
+    progress.on('error', fail)
+    gunzip.on('error', fail)
+    extract.on('error', fail)
+    extract.on('finish', resolve)
+
+    res.pipe(progress).pipe(gunzip).pipe(extract)
+  })"#;
+
+    let mut patched = String::with_capacity(raw.len() + replacement.len());
+    patched.push_str(&raw[..start]);
+    patched.push_str(replacement);
+    patched.push_str(&raw[end..]);
+    fs::write(&index_path, patched)?;
+
+    Ok(Some(format!(
+        "freebuff stream pipeline patched: {}",
+        display_path(&index_path)
+    )))
 }
 
 fn install_archive_tool(
@@ -711,10 +810,6 @@ fn install_archive_tool(
         .ok_or_else(|| AppError::Message(format!("{} 未配置归档文件名", tool.name)))?;
     let download_path = app.path(&format!("cache/downloads/{}", archive_name));
     let destination = app.path(&tool.base_path);
-    let staging = app.path(&format!("cache/staging/{}-install", tool.id));
-    ensure_safe_child_path(app, &download_path, "下载缓存路径")?;
-    ensure_safe_child_path(app, &destination, "工具安装目录")?;
-    ensure_safe_child_path(app, &staging, "安装临时目录")?;
     fs::create_dir_all(download_path.parent().unwrap_or(&app.root))?;
 
     if !download_path.exists() {
@@ -725,12 +820,19 @@ fn install_archive_tool(
             .arg("Bypass")
             .arg("-Command")
             .arg(format!(
-                "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
+                "$ProgressPreference = 'SilentlyContinue'; \
+                 try {{ Invoke-WebRequest -Uri '{}' -OutFile '{}' \
+                    -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 5 }} \
+                 catch {{ if (Test-Path '{}') {{ Remove-Item -LiteralPath '{}' -Force }} ; throw }}",
                 escape_single_quote(url),
-                escape_single_quote(&child_process_path(&download_path))
+                escape_single_quote(&display_path(&download_path)),
+                escape_single_quote(&display_path(&download_path)),
+                escape_single_quote(&display_path(&download_path))
             ));
         let output = download.output()?;
         if !output.status.success() {
+            // Drop any half-written file so a subsequent retry redownloads.
+            let _ = fs::remove_file(&download_path);
             let combined = command_output(&output);
             persist_action_state(app, tool, false, Some(url.to_string()), &combined)?;
             return Ok(ToolCommandResult {
@@ -743,8 +845,10 @@ fn install_archive_tool(
         }
     }
 
-    remove_dir_all_if_exists(app, &staging, "安装临时目录")?;
-    fs::create_dir_all(&staging)?;
+    if destination.exists() {
+        fs::remove_dir_all(&destination)?;
+    }
+    fs::create_dir_all(&destination)?;
 
     let mut expand = Command::new("powershell.exe");
     expand
@@ -754,22 +858,13 @@ fn install_archive_tool(
         .arg("-Command")
         .arg(format!(
             "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            escape_single_quote(&child_process_path(&download_path)),
-            escape_single_quote(&child_process_path(&staging))
+            escape_single_quote(&display_path(&download_path)),
+            escape_single_quote(&display_path(&destination))
         ));
     let output = expand.output()?;
+    flatten_single_root(&destination)?;
     let combined = command_output(&output);
     let success = output.status.success();
-    if success {
-        flatten_single_root(&staging)?;
-        remove_dir_all_if_exists(app, &destination, "工具安装目录")?;
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::rename(&staging, &destination)?;
-    } else {
-        let _ = remove_dir_all_if_exists(app, &staging, "安装临时目录");
-    }
     persist_action_state(app, tool, success, Some(url.to_string()), &combined)?;
 
     Ok(ToolCommandResult {
@@ -785,36 +880,74 @@ fn install_archive_tool(
     })
 }
 
-fn install_command_tool(
+fn install_powershell_script_tool(
     app: &AppState,
     tool: &ToolDefinition,
 ) -> Result<ToolCommandResult, AppError> {
-    let command_line = tool
+    let script_url = tool
         .install
-        .command
+        .script_url
         .as_ref()
-        .ok_or_else(|| AppError::Message(format!("{} 未配置安装命令", tool.name)))?;
-    validate_custom_command(command_line)?;
-    let tool_root = app.path(&tool.base_path);
-    ensure_safe_child_path(app, &tool_root, "工具安装目录")?;
-    fs::create_dir_all(&tool_root)?;
+        .ok_or_else(|| AppError::Message(format!("{} 未配置安装脚本地址", tool.name)))?;
+    let destination = app.path(&tool.base_path);
+    fs::create_dir_all(&destination)?;
 
-    let mut command = Command::new("cmd.exe");
-    append_cmd_once_raw_args(&mut command, command_line);
-    command.current_dir(child_process_path(&tool_root));
-    apply_portable_env(app, &mut command);
-    prepend_portable_tools_path(app, &mut command);
+    let script_path = app.path("cache/downloads/install_temp.ps1");
+    if let Some(parent) = script_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
-    let output = command.output()?;
-    let combined = command_output(&output);
-    let success = output.status.success();
-    persist_action_state(
-        app,
-        tool,
-        success,
-        Some(command_line.to_string()),
-        &combined,
-    )?;
+    // Download the PowerShell script
+    let mut download = Command::new("powershell.exe");
+    download
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(format!(
+            "$ProgressPreference = 'SilentlyContinue'; \
+             try {{ Invoke-WebRequest -Uri '{}' -OutFile '{}' \
+                -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 5 }} \
+             catch {{ if (Test-Path '{}') {{ Remove-Item -LiteralPath '{}' -Force }} ; throw }}",
+            escape_single_quote(script_url),
+            escape_single_quote(&display_path(&script_path)),
+            escape_single_quote(&display_path(&script_path)),
+            escape_single_quote(&display_path(&script_path))
+        ));
+    let download_output = download.output()?;
+    if !download_output.status.success() {
+        let _ = fs::remove_file(&script_path);
+        let combined = command_output(&download_output);
+        persist_action_state(app, tool, false, Some(script_url.to_string()), &combined)?;
+        return Ok(ToolCommandResult {
+            tool_id: tool.id.clone(),
+            action: "install".to_string(),
+            success: false,
+            message: format!("{} 脚本下载失败", tool.name),
+            output: combined,
+        });
+    }
+
+    // Execute the PowerShell script with argument `--dir <destination>`
+    let mut run = Command::new("powershell.exe");
+    run.arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(display_path(&script_path))
+        .arg("--dir")
+        .arg(display_path(&destination));
+
+    apply_portable_env(app, &mut run);
+
+    let run_output = run.output()?;
+    let combined = command_output(&run_output);
+    let success = run_output.status.success();
+
+    // Clean up the temporary script file
+    let _ = fs::remove_file(&script_path);
+
+    persist_action_state(app, tool, success, Some(script_url.to_string()), &combined)?;
 
     Ok(ToolCommandResult {
         tool_id: tool.id.clone(),
@@ -823,173 +956,17 @@ fn install_command_tool(
         message: if success {
             format!("{} 已安装", tool.name)
         } else {
-            format!("{} 安装失败", tool.name)
+            format!("{} 安装脚本执行失败", tool.name)
         },
         output: combined,
     })
 }
 
-pub fn add_custom_npm_tool(
-    app: &AppState,
-    request: AddNpmToolRequest,
-) -> Result<ToolCommandResult, AppError> {
-    bootstrap_kit(app)?;
-    let mut custom = load_custom_tools(app)?;
-    let tool = custom_npm_tool_from_request(&request)?;
-    ensure_unique_tool_id(app, &tool.id)?;
-    custom.tools.push(tool.clone());
-    save_custom_tools(app, &custom)?;
-
-    if request.install_now {
-        let manifest = load_manifest(app)?;
-        let settings = load_settings(app)?;
-        install_tool(app, &manifest, &settings, find_tool(&manifest, &tool.id)?)
-    } else {
-        Ok(ToolCommandResult {
-            tool_id: tool.id,
-            action: "add".to_string(),
-            success: true,
-            message: format!("{} 已添加", tool.name),
-            output: String::new(),
-        })
-    }
-}
-
-pub fn add_custom_command_tool(
-    app: &AppState,
-    request: AddCommandToolRequest,
-) -> Result<ToolCommandResult, AppError> {
-    bootstrap_kit(app)?;
-    validate_custom_command(&request.install_command)?;
-    let mut custom = load_custom_tools(app)?;
-    let tool = custom_command_tool_from_request(&request)?;
-    ensure_unique_tool_id(app, &tool.id)?;
-    custom.tools.push(tool.clone());
-    save_custom_tools(app, &custom)?;
-
-    if request.install_now {
-        let manifest = load_manifest(app)?;
-        let settings = load_settings(app)?;
-        install_tool(app, &manifest, &settings, find_tool(&manifest, &tool.id)?)
-    } else {
-        Ok(ToolCommandResult {
-            tool_id: tool.id,
-            action: "add".to_string(),
-            success: true,
-            message: format!("{} 已添加", tool.name),
-            output: String::new(),
-        })
-    }
-}
-
-pub fn search_npm_packages(
-    app: &AppState,
-    query: &str,
-) -> Result<Vec<NpmPackageCandidate>, AppError> {
-    bootstrap_kit(app)?;
-    let query = clean_required(query, "搜索关键词")?;
-    let settings = load_settings(app)?;
-    let registry = resolve_registry(app, &settings)?;
-    let npm = find_npm(app)?;
-    let npm_cache = app.path("cache/npm");
-    fs::create_dir_all(&npm_cache)?;
-
-    let mut command = Command::new(npm);
-    command
-        .arg("search")
-        .arg(&query)
-        .arg("--json")
-        .arg("--registry")
-        .arg(registry)
-        .arg("--cache")
-        .arg(child_process_path(&npm_cache))
-        .current_dir(child_process_path(&app.root));
-    apply_portable_env(app, &mut command);
-    prepend_portable_tools_path(app, &mut command);
-
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(AppError::Message(command_output(&output)));
-    }
-    let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-    Ok(values
-        .into_iter()
-        .take(12)
-        .filter_map(|value| {
-            let name = value.get("name")?.as_str()?.to_string();
-            Some(NpmPackageCandidate {
-                name,
-                version: value
-                    .get("version")
-                    .and_then(|item| item.as_str())
-                    .map(str::to_string),
-                description: value
-                    .get("description")
-                    .and_then(|item| item.as_str())
-                    .map(str::to_string),
-            })
-        })
-        .collect())
-}
-
-pub fn inspect_npm_package(
-    app: &AppState,
-    package_name: &str,
-) -> Result<NpmPackageSuggestion, AppError> {
-    bootstrap_kit(app)?;
-    let package_name = clean_required(package_name, "npm 包名")?;
-    let settings = load_settings(app)?;
-    let registry = resolve_registry(app, &settings)?;
-    let npm = find_npm(app)?;
-    let npm_cache = app.path("cache/npm");
-    fs::create_dir_all(&npm_cache)?;
-
-    let mut command = Command::new(npm);
-    command
-        .arg("view")
-        .arg(&package_name)
-        .arg("name")
-        .arg("version")
-        .arg("description")
-        .arg("bin")
-        .arg("--json")
-        .arg("--registry")
-        .arg(registry)
-        .arg("--cache")
-        .arg(child_process_path(&npm_cache))
-        .current_dir(child_process_path(&app.root));
-    apply_portable_env(app, &mut command);
-    prepend_portable_tools_path(app, &mut command);
-
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(AppError::Message(command_output(&output)));
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let resolved_name = value
-        .get("name")
-        .and_then(|item| item.as_str())
-        .unwrap_or(&package_name)
-        .to_string();
-    let bin_names = npm_bin_names(value.get("bin"), &resolved_name);
-
-    Ok(NpmPackageSuggestion {
-        name: resolved_name,
-        version: value
-            .get("version")
-            .and_then(|item| item.as_str())
-            .map(str::to_string),
-        description: value
-            .get("description")
-            .and_then(|item| item.as_str())
-            .map(str::to_string),
-        bin_names,
-    })
-}
-
 fn uninstall_tool(app: &AppState, tool: &ToolDefinition) -> Result<ToolCommandResult, AppError> {
     let destination = app.path(&tool.base_path);
-    remove_dir_all_if_exists(app, &destination, "工具安装目录")?;
+    if destination.exists() {
+        fs::remove_dir_all(&destination)?;
+    }
 
     let mut state = load_state(app)?;
     state.tools.remove(&tool.id);
@@ -1007,7 +984,8 @@ fn uninstall_tool(app: &AppState, tool: &ToolDefinition) -> Result<ToolCommandRe
 fn tool_view(
     app: &AppState,
     tool: &ToolDefinition,
-    state: &ToolStateFile,
+    state: &mut ToolStateFile,
+    force: bool,
 ) -> Result<ToolView, AppError> {
     let base = app.path(&tool.base_path);
     let launch = find_existing_path(&base, &tool.bin_paths);
@@ -1018,14 +996,29 @@ fn tool_view(
     } else {
         ToolStatus::Missing
     };
-    let persisted = state.tools.get(&tool.id).cloned().unwrap_or_default();
+    let mut persisted = state.tools.get(&tool.id).cloned().unwrap_or_default();
     let detected_version = if status == ToolStatus::Ready {
-        detect_version(app, tool)
+        if force || persisted.installed_version.is_none() {
+            let detected = detect_version(app, tool);
+            persisted.installed_version = detected.clone();
+            detected
+        } else {
+            persisted.installed_version.clone()
+        }
     } else {
         None
     };
-    let host_version = detect_host_version(tool);
+    let host_version = if tool.host_version_command.is_empty() {
+        None
+    } else if force || persisted.host_version.is_none() {
+        let detected = detect_host_version(tool);
+        persisted.host_version = detected.clone();
+        detected
+    } else {
+        persisted.host_version.clone()
+    };
     let host_available = host_version.is_some();
+    state.tools.insert(tool.id.clone(), persisted.clone());
 
     Ok(ToolView {
         id: tool.id.clone(),
@@ -1046,6 +1039,85 @@ fn tool_view(
     })
 }
 
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::thread;
+
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().ok()?;
+
+    // Drain stdout/stderr concurrently to avoid the pipe-buffer-full deadlock.
+    let stdout_buf: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+    let stderr_buf: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_thread = stdout_pipe.map({
+        let buf = Arc::clone(&stdout_buf);
+        move |mut pipe| {
+            thread::spawn(move || {
+                let mut local = Vec::new();
+                let _ = pipe.read_to_end(&mut local);
+                if let Ok(mut guard) = buf.lock() {
+                    guard.extend(local);
+                }
+            })
+        }
+    });
+    let stderr_thread = stderr_pipe.map({
+        let buf = Arc::clone(&stderr_buf);
+        move |mut pipe| {
+            thread::spawn(move || {
+                let mut local = Vec::new();
+                let _ = pipe.read_to_end(&mut local);
+                if let Ok(mut guard) = buf.lock() {
+                    guard.extend(local);
+                }
+            })
+        }
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    if let Some(handle) = stdout_thread {
+        let _ = handle.join();
+    }
+    if let Some(handle) = stderr_thread {
+        let _ = handle.join();
+    }
+
+    let status = status?;
+    let stdout = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
+    let stderr = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn detect_version(app: &AppState, tool: &ToolDefinition) -> Option<String> {
     if tool.version_command.is_empty() {
         return None;
@@ -1054,21 +1126,17 @@ fn detect_version(app: &AppState, tool: &ToolDefinition) -> Option<String> {
     if !exe.exists() {
         return None;
     }
-    let mut command = Command::new(child_process_path(&exe));
+    let mut command = Command::new(exe);
     for arg in tool.version_command.iter().skip(1) {
         command.arg(arg);
     }
-    command.current_dir(child_process_path(&app.path(&tool.base_path)));
+    command.current_dir(app.path(&tool.base_path));
     apply_portable_env(app, &mut command);
-    prepend_portable_tools_path(app, &mut command);
-    command
-        .output()
-        .ok()
+    prepend_portable_paths(app, &mut command);
+    run_command_with_timeout(command, std::time::Duration::from_secs(3))
         .and_then(|output| {
             if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                Some(if stdout.is_empty() { stderr } else { stdout })
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
             } else {
                 None
             }
@@ -1082,16 +1150,19 @@ fn detect_host_version(tool: &ToolDefinition) -> Option<String> {
     }
 
     let executable = &tool.host_version_command[0];
-    host_executable_path(executable)?;
+    // Resolve the absolute host path (bypassing any portable PATH) so the
+    // version detection truly reflects the host machine's installation.
+    let absolute = host_executable_path(executable)?;
 
-    let mut command = Command::new(executable);
+    let mut command = Command::new(&absolute);
     for arg in tool.host_version_command.iter().skip(1) {
         command.arg(arg);
     }
+    if let Some(system_path) = host_system_path() {
+        command.env("PATH", system_path);
+    }
 
-    command
-        .output()
-        .ok()
+    run_command_with_timeout(command, std::time::Duration::from_secs(3))
         .and_then(|output| {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1104,10 +1175,167 @@ fn detect_host_version(tool: &ToolDefinition) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketplaceTool {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub package_name: String,
+    pub category: String,
+    pub homepage: String,
+    pub in_manifest: bool,
+    pub installed: bool,
+}
+
+pub fn get_marketplace_tools(app: &AppState) -> Result<Vec<MarketplaceTool>, AppError> {
+    let manifest = load_manifest(app)?;
+    let _state = load_state(app)?;
+
+    let all_tools = vec![
+        MarketplaceTool {
+            id: "codebuff".to_string(),
+            name: "Codebuff".to_string(),
+            description: "AI驱动的对话式编程助手，在终端中通过自然语言与AI协作编码".to_string(),
+            package_name: "codebuff".to_string(),
+            category: "AI CLI".to_string(),
+            homepage: "https://codebuff.com".to_string(),
+            in_manifest: false,
+            installed: false,
+        },
+        MarketplaceTool {
+            id: "freebuff".to_string(),
+            name: "freebuff".to_string(),
+            description: "免费开源的AI CLI工具箱，支持多种AI模型的命令行交互".to_string(),
+            package_name: "freebuff".to_string(),
+            category: "AI CLI".to_string(),
+            homepage: "https://deerflow.tech".to_string(),
+            in_manifest: false,
+            installed: false,
+        },
+        MarketplaceTool {
+            id: "github-copilot".to_string(),
+            name: "GitHub Copilot CLI".to_string(),
+            description: "GitHub官方AI命令行助手，在终端中获取AI驱动的代码建议和解释".to_string(),
+            package_name: "@githubnext/github-copilot-cli".to_string(),
+            category: "AI CLI".to_string(),
+            homepage: "https://github.com/githubnext/github-copilot-cli".to_string(),
+            in_manifest: false,
+            installed: false,
+        },
+        MarketplaceTool {
+            id: "claude".to_string(),
+            name: "Claude Code".to_string(),
+            description: "Anthropic 官方AI编程助手（已在工具清单中）".to_string(),
+            package_name: "@anthropic-ai/claude-code".to_string(),
+            category: "AI CLI".to_string(),
+            homepage: "https://docs.anthropic.com/en/docs/claude-code".to_string(),
+            in_manifest: true,
+            installed: false,
+        },
+        MarketplaceTool {
+            id: "codex".to_string(),
+            name: "Codex CLI".to_string(),
+            description: "OpenAI 官方AI编程助手（已在工具清单中）".to_string(),
+            package_name: "@openai/codex".to_string(),
+            category: "AI CLI".to_string(),
+            homepage: "https://openai.com/index/codex-cli".to_string(),
+            in_manifest: true,
+            installed: false,
+        },
+        MarketplaceTool {
+            id: "antigravity".to_string(),
+            name: "Antigravity CLI".to_string(),
+            description: "Google 官方AI CLI工具（已在工具清单中）".to_string(),
+            package_name: "antigravity".to_string(),
+            category: "AI CLI".to_string(),
+            homepage: "https://antigravity.google".to_string(),
+            in_manifest: true,
+            installed: false,
+        },
+    ];
+
+    let result_tools: Vec<MarketplaceTool> = all_tools
+        .into_iter()
+        .map(|mut tool| {
+            let custom_id = format!("custom-{}", tool.id);
+            // Check if installed via manifest (built-in) or custom-tools
+            let in_manifest = manifest.tools.iter().any(|t| t.id == tool.id)
+                || manifest.tools.iter().any(|t| t.id == custom_id);
+            tool.in_manifest = in_manifest;
+            // Check if installed via manifest tool status
+            let is_installed = manifest.tools.iter().any(|t| {
+                (t.id == tool.id || t.id == custom_id)
+                    && app.path(&t.base_path).exists()
+                    && t.bin_paths
+                        .iter()
+                        .any(|bin| app.path(&t.base_path).join(bin.replace('/', "\\")).exists())
+            });
+            tool.installed = is_installed;
+            tool
+        })
+        .collect();
+
+    Ok(result_tools)
+}
+
+pub fn install_marketplace_tool(
+    app: &AppState,
+    id: String,           // marketplace tool ID (e.g. "claude", "codebuff")
+    name: String,         // display name (e.g. "Claude Code", "Codebuff")
+    package_name: String, // npm package name
+) -> Result<ToolCommandResult, AppError> {
+    bootstrap_kit(app)?;
+    let manifest = load_manifest(app)?;
+    let settings = load_settings(app)?;
+
+    let custom_tool_id = format!("custom-{}", id);
+
+    // Check if tool is already in manifest (built-in like "claude", "codex", "antigravity")
+    // or already added as a custom tool ("custom-<id>")
+    if let Some(tool) = manifest
+        .tools
+        .iter()
+        .find(|t| t.id == id || t.id == custom_tool_id)
+    {
+        return tool_action(app, ToolActionRequest::new(tool.id.clone(), "install"));
+    }
+
+    // Not in manifest, add as custom tool first, then install
+    add_custom_tool(
+        app,
+        name.clone(),
+        "npm",
+        Some(package_name.clone()),
+        None,
+        None,
+    )?;
+
+    let updated_manifest = load_manifest(app)?;
+    if let Some(tool) = updated_manifest
+        .tools
+        .iter()
+        .find(|t| t.id == custom_tool_id)
+    {
+        return install_tool(app, &updated_manifest, &settings, tool);
+    }
+
+    Err(AppError::Message(format!(
+        "添加工具「{}」后无法找到其定义",
+        name
+    )))
+}
+
 fn host_executable_path(executable: &str) -> Option<String> {
-    Command::new("where.exe")
-        .arg(executable)
-        .output()
+    // Detect on the host machine's PATH by reading the canonical "Path" value
+    // from the registry/system rather than the (possibly portable-augmented)
+    // process environment, then run where.exe with that PATH.
+    let mut cmd = Command::new("where.exe");
+    cmd.arg(executable);
+    if let Some(system_path) = host_system_path() {
+        cmd.env("PATH", system_path);
+    }
+    cmd.output()
         .ok()
         .and_then(|output| {
             if output.status.success() {
@@ -1122,28 +1350,46 @@ fn host_executable_path(executable: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn host_system_path() -> Option<String> {
+    // PowerShell to read the Machine + User PATH (i.e. the host's PATH as seen
+    // by a freshly spawned cmd window), so portable PATH prepends do not leak.
+    let output = Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(
+            "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + \
+             [Environment]::GetEnvironmentVariable('Path','User')",
+        )
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() || value == ";" {
+        None
+    } else {
+        Some(value)
+    }
+}
+const CUSTOM_TOOLS_PATH: &str = "config/custom-tools.json";
+
 fn load_manifest(app: &AppState) -> Result<Manifest, AppError> {
     let raw = fs::read_to_string(app.path(MANIFEST_PATH))?;
     let mut manifest: Manifest = serde_json::from_str(&raw)?;
-    manifest.tools.extend(load_custom_tools(app)?.tools);
-    Ok(manifest)
-}
 
-fn load_custom_tools(app: &AppState) -> Result<CustomToolsFile, AppError> {
-    let path = app.path(CUSTOM_TOOLS_PATH);
-    if !path.exists() {
-        return Ok(CustomToolsFile::default());
+    let custom_path = app.path(CUSTOM_TOOLS_PATH);
+    if custom_path.exists() {
+        if let Ok(custom_raw) = fs::read_to_string(&custom_path) {
+            if let Ok(custom_file) = serde_json::from_str::<CustomToolsFile>(&custom_raw) {
+                manifest.tools.extend(custom_file.tools);
+            }
+        }
     }
-    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
-}
 
-fn save_custom_tools(app: &AppState, custom: &CustomToolsFile) -> Result<(), AppError> {
-    fs::create_dir_all(app.path("config"))?;
-    fs::write(
-        app.path(CUSTOM_TOOLS_PATH),
-        serde_json::to_string_pretty(custom)?,
-    )?;
-    Ok(())
+    Ok(manifest)
 }
 
 fn load_settings(app: &AppState) -> Result<Settings, AppError> {
@@ -1151,7 +1397,21 @@ fn load_settings(app: &AppState) -> Result<Settings, AppError> {
     if !path.exists() {
         return Ok(Settings::default());
     }
-    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+    let mut settings: Settings = serde_json::from_str(&fs::read_to_string(path)?)?;
+    settings.workspace_path = sanitize_relative_path(&settings.workspace_path, "workspace");
+    Ok(settings)
+}
+
+fn sanitize_relative_path(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return fallback.to_string();
+    }
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() || trimmed.contains("..") {
+        return fallback.to_string();
+    }
+    trimmed.replace('\\', "/")
 }
 
 fn load_state(app: &AppState) -> Result<ToolStateFile, AppError> {
@@ -1159,12 +1419,33 @@ fn load_state(app: &AppState) -> Result<ToolStateFile, AppError> {
     if !path.exists() {
         return Ok(ToolStateFile::default());
     }
-    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+    let raw = fs::read_to_string(&path)?;
+    if raw.trim().is_empty() {
+        let _ = fs::remove_file(&path);
+        return Ok(ToolStateFile::default());
+    }
+    match serde_json::from_str(&raw) {
+        Ok(state) => Ok(state),
+        Err(_) => {
+            // Corrupted state file from prior crash; reset rather than blocking app startup.
+            let _ = fs::remove_file(&path);
+            Ok(ToolStateFile::default())
+        }
+    }
 }
 
 fn save_state(app: &AppState, state: &ToolStateFile) -> Result<(), AppError> {
-    fs::create_dir_all(app.path("state"))?;
-    fs::write(app.path(STATE_PATH), serde_json::to_string_pretty(state)?)?;
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state_dir = app.path("state");
+    fs::create_dir_all(&state_dir)?;
+    let final_path = app.path(STATE_PATH);
+    let temp_path = state_dir.join("tool-state.json.tmp");
+    let serialized = serde_json::to_string_pretty(state)?;
+    fs::write(&temp_path, serialized)?;
+    if final_path.exists() {
+        fs::remove_file(&final_path)?;
+    }
+    fs::rename(&temp_path, &final_path)?;
     Ok(())
 }
 
@@ -1222,181 +1503,12 @@ fn install_source(tool: &ToolDefinition) -> String {
             .archive_name
             .clone()
             .unwrap_or_else(|| "archive".to_string()),
-        InstallType::Command => tool
+        InstallType::PowershellScript => tool
             .install
-            .command
+            .script_url
             .clone()
-            .unwrap_or_else(|| "custom command".to_string()),
+            .unwrap_or_else(|| "script".to_string()),
     }
-}
-
-fn custom_npm_tool_from_request(request: &AddNpmToolRequest) -> Result<ToolDefinition, AppError> {
-    let name = clean_required(&request.name, "工具名称")?;
-    let package_name = clean_required(&request.package_name, "npm 包名")?;
-    let bin_name = clean_required(&request.bin_name, "bin 名称")?;
-    let id = custom_tool_id(&name);
-    let bin_path = format!("node_modules/.bin/{}.cmd", bin_name);
-    let mut login_command = vec![bin_path.clone()];
-    if let Some(args) = &request.login_args {
-        login_command.extend(parse_command_line(args)?);
-    }
-
-    Ok(ToolDefinition {
-        id: id.clone(),
-        name,
-        kind: ToolKind::AiCli,
-        required: false,
-        base_path: format!("tools/custom/{}", id),
-        package_name: Some(package_name),
-        version_command: vec![bin_path.clone(), "--version".to_string()],
-        host_version_command: vec![bin_name.clone(), "--version".to_string()],
-        bin_paths: vec![bin_path.clone()],
-        run_command: vec![bin_path.clone()],
-        login_command,
-        install: InstallDefinition {
-            install_type: InstallType::Npm,
-            depends_on: vec!["node".to_string()],
-            archive_name: None,
-            installer_type: None,
-            command: None,
-            urls: BTreeMap::new(),
-        },
-    })
-}
-
-fn custom_command_tool_from_request(
-    request: &AddCommandToolRequest,
-) -> Result<ToolDefinition, AppError> {
-    let name = clean_required(&request.name, "工具名称")?;
-    let install_command = clean_required(&request.install_command, "安装命令")?;
-    let run_command = parse_command_line(&clean_required(&request.run_command, "启动命令")?)?;
-    if run_command.is_empty() {
-        return Err(AppError::Message("启动命令不能为空".to_string()));
-    }
-    let version_command = optional_command_line(&request.version_command)?;
-    let login_command = optional_command_line(&request.login_command)?;
-    let id = custom_tool_id(&name);
-    let bin_path = run_command[0].replace('/', "\\");
-
-    Ok(ToolDefinition {
-        id: id.clone(),
-        name,
-        kind: ToolKind::AiCli,
-        required: false,
-        base_path: format!("tools/custom/{}", id),
-        package_name: None,
-        version_command,
-        host_version_command: Vec::new(),
-        bin_paths: vec![bin_path],
-        run_command,
-        login_command,
-        install: InstallDefinition {
-            install_type: InstallType::Command,
-            depends_on: Vec::new(),
-            archive_name: None,
-            installer_type: None,
-            command: Some(install_command),
-            urls: BTreeMap::new(),
-        },
-    })
-}
-
-fn clean_required(input: &str, label: &str) -> Result<String, AppError> {
-    let value = input.trim();
-    if value.is_empty() {
-        Err(AppError::Message(format!("{}不能为空", label)))
-    } else {
-        Ok(value.to_string())
-    }
-}
-
-fn optional_command_line(input: &Option<String>) -> Result<Vec<String>, AppError> {
-    match input {
-        Some(value) if !value.trim().is_empty() => parse_command_line(value),
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn custom_tool_id(name: &str) -> String {
-    let mut id = String::new();
-    for ch in name.trim().to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() {
-            id.push(ch);
-        } else if (ch.is_whitespace() || ch == '-' || ch == '_' || ch == '.' || ch == '/')
-            && !id.ends_with('-')
-        {
-            id.push('-');
-        }
-    }
-    let id = id.trim_matches('-');
-    if id.is_empty() {
-        "custom-ai-cli".to_string()
-    } else {
-        format!("custom-{}", id)
-    }
-}
-
-fn ensure_unique_tool_id(app: &AppState, tool_id: &str) -> Result<(), AppError> {
-    let manifest = load_manifest(app)?;
-    if manifest.tools.iter().any(|tool| tool.id == tool_id) {
-        Err(AppError::Message(format!("工具已存在：{}", tool_id)))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_custom_command(command: &str) -> Result<(), AppError> {
-    let lower = command.to_lowercase();
-    let blocked = [
-        "remove-item",
-        " rmdir ",
-        " rd ",
-        " del ",
-        " erase ",
-        "format ",
-        "shutdown ",
-        "reg delete",
-        "git reset --hard",
-    ];
-    if blocked.iter().any(|pattern| lower.contains(pattern)) {
-        Err(AppError::Message(
-            "安装命令包含高风险删除/系统操作片段，已拒绝执行。".to_string(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn parse_command_line(input: &str) -> Result<Vec<String>, AppError> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = input.trim().chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            '\\' if chars.peek() == Some(&'"') => {
-                chars.next();
-                current.push('"');
-            }
-            ch if ch.is_whitespace() && !in_quotes => {
-                if !current.is_empty() {
-                    args.push(current.clone());
-                    current.clear();
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-
-    if in_quotes {
-        return Err(AppError::Message("命令中的双引号没有闭合".to_string()));
-    }
-    if !current.is_empty() {
-        args.push(current);
-    }
-    Ok(args)
 }
 
 fn find_existing_path<T: AsRef<str>>(base: &Path, relatives: &[T]) -> Option<PathBuf> {
@@ -1415,24 +1527,6 @@ fn find_existing_path<T: AsRef<str>>(base: &Path, relatives: &[T]) -> Option<Pat
         }
     }
     None
-}
-
-fn find_npm(app: &AppState) -> Result<PathBuf, AppError> {
-    let node_root = app.path("apps/node");
-    find_existing_path(&node_root, &["npm.cmd", "node_modules/npm/bin/npm-cli.js"])
-        .ok_or_else(|| AppError::Message("Node/npm 尚未安装".to_string()))
-}
-
-fn npm_bin_names(bin: Option<&serde_json::Value>, package_name: &str) -> Vec<String> {
-    match bin {
-        Some(serde_json::Value::String(_value)) => vec![package_name
-            .rsplit('/')
-            .next()
-            .unwrap_or(package_name)
-            .to_string()],
-        Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
-        _ => Vec::new(),
-    }
 }
 
 fn resolve_tool_relative(app: &AppState, tool: &ToolDefinition, relative: &str) -> PathBuf {
@@ -1458,40 +1552,6 @@ fn display_path(path: &Path) -> String {
     }
 }
 
-fn child_process_path(path: &Path) -> String {
-    display_path(path)
-}
-
-fn ensure_safe_child_path(app: &AppState, path: &Path, label: &str) -> Result<(), AppError> {
-    let root = comparable_path(&app.root);
-    let target = comparable_path(path);
-    let root_prefix = format!("{}\\", root);
-    if target.starts_with(&root_prefix) {
-        Ok(())
-    } else {
-        Err(AppError::Message(format!(
-            "{} 不在便携环境根目录内：{}",
-            label,
-            display_path(path)
-        )))
-    }
-}
-
-fn remove_dir_all_if_exists(app: &AppState, path: &Path, label: &str) -> Result<(), AppError> {
-    ensure_safe_child_path(app, path, label)?;
-    if path.exists() {
-        fs::remove_dir_all(path)?;
-    }
-    Ok(())
-}
-
-fn comparable_path(path: &Path) -> String {
-    display_path(path)
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
-}
-
 fn find_manifest_root(path: &Path) -> Option<PathBuf> {
     let mut current = path.to_path_buf();
     loop {
@@ -1505,52 +1565,57 @@ fn find_manifest_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn apply_portable_env(app: &AppState, command: &mut Command) {
+    let home = display_path(&app.path("state/home"));
+    let appdata = display_path(&app.path("state/appdata"));
+    let localappdata = display_path(&app.path("state/localappdata"));
+    let temp = display_path(&app.path("state/temp"));
+    let _ = fs::create_dir_all(app.path("state/temp"));
+    let npm_cache = display_path(&app.path("cache/npm"));
+    let _ = fs::create_dir_all(app.path("cache/npm"));
+    let npm_prefix = display_path(&app.path("apps/node"));
+
     command
-        .env("HOME", child_process_path(&app.path("state/home")))
-        .env("USERPROFILE", child_process_path(&app.path("state/home")))
-        .env("APPDATA", child_process_path(&app.path("state/appdata")))
-        .env(
-            "LOCALAPPDATA",
-            child_process_path(&app.path("state/localappdata")),
-        )
-        .env(
-            "XDG_CONFIG_HOME",
-            child_process_path(&app.path("state/xdg/config")),
-        )
-        .env(
-            "XDG_CACHE_HOME",
-            child_process_path(&app.path("state/xdg/cache")),
-        )
-        .env(
-            "XDG_STATE_HOME",
-            child_process_path(&app.path("state/xdg/state")),
-        );
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
+        .env("XDG_CONFIG_HOME", display_path(&app.path("state/xdg/config")))
+        .env("XDG_CACHE_HOME", display_path(&app.path("state/xdg/cache")))
+        .env("XDG_STATE_HOME", display_path(&app.path("state/xdg/state")))
+        .env("XDG_DATA_HOME", display_path(&app.path("state/xdg/data")))
+        .env("TEMP", &temp)
+        .env("TMP", &temp)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("NPM_CONFIG_CACHE", npm_cache)
+        .env("NPM_CONFIG_PREFIX", npm_prefix);
 }
 
 fn prepend_path(command: &mut Command, path: &Path) {
     let original = env::var("PATH").unwrap_or_default();
-    command.env("PATH", format!("{};{}", child_process_path(path), original));
+    command.env("PATH", format!("{};{}", display_path(path), original));
 }
 
-fn prepend_portable_tools_path(app: &AppState, command: &mut Command) {
-    let mut paths = Vec::new();
-    for relative in [
-        "apps/node",
-        "apps/git/cmd",
-        "apps/git/bin",
-        "apps/git/mingw64/bin",
-    ] {
-        let path = app.path(relative);
-        if path.exists() {
-            paths.push(child_process_path(&path));
-        }
+fn prepend_portable_paths(app: &AppState, command: &mut Command) {
+    let mut paths_to_prepend = Vec::new();
+    let node_dir = app.path("apps/node");
+    if node_dir.exists() {
+        paths_to_prepend.push(node_dir);
     }
-    if paths.is_empty() {
-        return;
+    let git_dir = app.path("apps/git");
+    if git_dir.exists() {
+        paths_to_prepend.push(git_dir.join("cmd"));
+        paths_to_prepend.push(git_dir.join("bin"));
+        paths_to_prepend.push(git_dir.join("mingw64\\bin"));
     }
-    let original = env::var("PATH").unwrap_or_default();
-    paths.push(original);
-    command.env("PATH", paths.join(";"));
+    let original_path = env::var("PATH").unwrap_or_default();
+    let mut new_path_parts = Vec::new();
+    for p in paths_to_prepend {
+        new_path_parts.push(display_path(&p));
+    }
+    if !original_path.is_empty() {
+        new_path_parts.push(original_path);
+    }
+    command.env("PATH", new_path_parts.join(";"));
 }
 
 fn command_output(output: &std::process::Output) -> String {
@@ -1559,50 +1624,24 @@ fn command_output(output: &std::process::Output) -> String {
     format!("{}{}", stdout, stderr).trim().to_string()
 }
 
-fn terminal_command_line(exe: &Path, command: &[String]) -> String {
-    let exe_text = child_process_path(exe);
-    let args = command
-        .iter()
-        .skip(1)
-        .map(|arg| quote_cmd_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if args.is_empty() {
-        format!("call \"{}\"", exe_text)
-    } else {
-        format!("call \"{}\" {}", exe_text, args)
-    }
-}
-
-fn terminal_launcher_command_line(launcher: &Path) -> String {
-    format!("call \"{}\"", child_process_path(launcher))
-}
-
-#[cfg(windows)]
-fn append_cmd_raw_args(command: &mut Command, command_line: &str) {
-    command.raw_arg(format!("/D /K {}", command_line));
-}
-
-#[cfg(windows)]
-fn append_cmd_once_raw_args(command: &mut Command, command_line: &str) {
-    command.raw_arg(format!("/D /C {}", command_line));
-}
-
-#[cfg(not(windows))]
-fn append_cmd_raw_args(command: &mut Command, command_line: &str) {
-    command.arg("/D").arg("/K").arg(command_line);
-}
-
-#[cfg(not(windows))]
-fn append_cmd_once_raw_args(command: &mut Command, command_line: &str) {
-    command.arg("/D").arg("/C").arg(command_line);
-}
-
 fn quote_cmd_arg(input: &str) -> String {
-    if input.is_empty() || input.chars().any(|c| c.is_whitespace() || c == '"') {
-        format!("\"{}\"", input.replace('"', "\\\""))
-    } else {
-        input.to_string()
+    // cmd.exe metacharacters that need protection when an argument is
+    // splatted into a .bat file.
+    const CMD_META: &[char] = &[' ', '\t', '"', '&', '|', '<', '>', '^', '(', ')', '%', '!', ';', ',', '`'];
+    if input.is_empty() {
+        return "\"\"".to_string();
+    }
+    if input.chars().any(|c| CMD_META.contains(&c)) {
+        let escaped = input.replace('"', "\\\"");
+        return format!("\"{}\"", escaped);
+    }
+    input.to_string()
+}
+
+fn action_log_prefix(purpose: &str) -> &'static str {
+    match purpose {
+        "登录" => "login",
+        _ => "launch",
     }
 }
 
@@ -1620,8 +1659,35 @@ fn flatten_single_root(destination: &Path) -> Result<(), AppError> {
     }
 
     let nested = entries[0].path();
+    let canonical_destination =
+        fs::canonicalize(destination).unwrap_or_else(|_| destination.to_path_buf());
+    let canonical_nested = fs::canonicalize(&nested).unwrap_or_else(|_| nested.clone());
+    if !canonical_nested.starts_with(&canonical_destination) {
+        return Err(AppError::Message(
+            "归档展开包含非法的路径符号链接".to_string(),
+        ));
+    }
+
     for child in fs::read_dir(&nested)?.flatten() {
-        fs::rename(child.path(), destination.join(child.file_name()))?;
+        let file_name = child.file_name();
+        // Reject path-component names that escape the destination.
+        let name_str = file_name.to_string_lossy();
+        if name_str == ".." || name_str == "." || name_str.contains('/') || name_str.contains('\\') {
+            return Err(AppError::Message(format!(
+                "归档包含非法路径条目：{}",
+                name_str
+            )));
+        }
+        let target = destination.join(&file_name);
+        if target.exists() {
+            // Avoid clobbering an entry that already exists at the destination.
+            if target.is_dir() {
+                fs::remove_dir_all(&target)?;
+            } else {
+                fs::remove_file(&target)?;
+            }
+        }
+        fs::rename(child.path(), target)?;
     }
     fs::remove_dir_all(nested)?;
     Ok(())
@@ -1677,6 +1743,209 @@ fn status_label(status: &ToolStatus) -> &'static str {
     }
 }
 
+pub fn add_custom_tool(
+    app: &AppState,
+    name: String,
+    install_type: &str,
+    package_name: Option<String>,
+    script_url: Option<String>,
+    bin_name: Option<String>,
+) -> Result<(), AppError> {
+    // Sanitize name to generate a valid tool ID (ASCII-only to avoid
+    // codepage issues in Windows .bat / cmd execution).
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(AppError::Message("工具名称不能为空".to_string()));
+    }
+    if trimmed_name.chars().count() > 64 {
+        return Err(AppError::Message("工具名称过长（最多 64 字符）".to_string()));
+    }
+    let mut id_name: String = trimmed_name
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    // Collapse leading/trailing dashes.
+    id_name = id_name.trim_matches(|c| c == '-' || c == '_').to_string();
+    if id_name.is_empty() {
+        // Fallback: derive ASCII id from package name / script url / hash.
+        let fallback_src = package_name
+            .as_deref()
+            .or(script_url.as_deref())
+            .unwrap_or("");
+        id_name = fallback_src
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        id_name = id_name.trim_matches(|c| c == '-' || c == '_').to_string();
+        if id_name.is_empty() {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&trimmed_name, &mut hasher);
+            id_name = format!("tool-{:x}", std::hash::Hasher::finish(&hasher) & 0xffff_ffff);
+        }
+    }
+    let tool_id = format!("custom-{}", id_name);
+
+    // Load existing manifest to check for duplicate IDs
+    let manifest = load_manifest(app)?;
+    if manifest.tools.iter().any(|t| t.id == tool_id) {
+        return Err(AppError::Message(format!("工具 '{}' 已存在", trimmed_name)));
+    }
+
+    // Load custom tools file
+    let custom_path = app.path(CUSTOM_TOOLS_PATH);
+    let mut custom_file = if custom_path.exists() {
+        let raw = fs::read_to_string(&custom_path)?;
+        match serde_json::from_str::<CustomToolsFile>(&raw) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Err(AppError::Message(format!(
+                    "无法解析 custom-tools.json：{}",
+                    error
+                )))
+            }
+        }
+    } else {
+        CustomToolsFile::default()
+    };
+
+    if custom_file.tools.iter().any(|t| t.id == tool_id) {
+        return Err(AppError::Message(format!("工具 '{}' 已存在", trimmed_name)));
+    }
+
+    let base_path = format!("tools/custom/custom-{}", id_name);
+
+    let name = trimmed_name.to_string();
+
+    let tool = if install_type == "powershell-script" {
+        let script_url_val =
+            script_url.ok_or_else(|| AppError::Message("脚本 URL 不能为空".to_string()))?;
+        let script_url_val = script_url_val.trim().to_string();
+        if script_url_val.is_empty() {
+            return Err(AppError::Message("脚本 URL 不能为空".to_string()));
+        }
+        let url_lower = script_url_val.to_lowercase();
+        if !(url_lower.starts_with("https://") || url_lower.starts_with("http://")) {
+            return Err(AppError::Message(
+                "脚本 URL 必须以 http:// 或 https:// 开头".to_string(),
+            ));
+        }
+
+        let actual_bin = bin_name.unwrap_or_default().trim().to_string();
+        let actual_bin = if actual_bin.is_empty() {
+            format!("{}.exe", id_name)
+        } else if !actual_bin.to_lowercase().ends_with(".exe")
+            && !actual_bin.to_lowercase().ends_with(".cmd")
+            && !actual_bin.to_lowercase().ends_with(".bat")
+        {
+            format!("{}.exe", actual_bin)
+        } else {
+            actual_bin
+        };
+
+        let host_bin = actual_bin
+            .strip_suffix(".exe")
+            .or_else(|| actual_bin.strip_suffix(".cmd"))
+            .or_else(|| actual_bin.strip_suffix(".bat"))
+            .unwrap_or(&actual_bin)
+            .to_string();
+
+        ToolDefinition {
+            id: tool_id,
+            name,
+            kind: ToolKind::AiCli,
+            required: false,
+            base_path,
+            package_name: None,
+            version_command: vec![actual_bin.clone(), "--version".to_string()],
+            host_version_command: vec![host_bin, "--version".to_string()],
+            bin_paths: vec![actual_bin.clone()],
+            run_command: vec![actual_bin.clone()],
+            login_command: vec![actual_bin],
+            install: InstallDefinition {
+                install_type: InstallType::PowershellScript,
+                depends_on: vec![],
+                archive_name: None,
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: Some(script_url_val),
+            },
+        }
+    } else {
+        let package_name_val =
+            package_name.ok_or_else(|| AppError::Message("NPM 包名不能为空".to_string()))?;
+        let package_name_val = package_name_val.trim().to_string();
+        if package_name_val.is_empty() {
+            return Err(AppError::Message("NPM 包名不能为空".to_string()));
+        }
+
+        let bin_path = format!("node_modules/.bin/{}.cmd", id_name);
+
+        ToolDefinition {
+            id: tool_id,
+            name,
+            kind: ToolKind::AiCli,
+            required: false,
+            base_path,
+            package_name: Some(package_name_val),
+            version_command: vec![bin_path.clone(), "--version".to_string()],
+            host_version_command: vec![id_name.clone(), "--version".to_string()],
+            bin_paths: vec![bin_path.clone()],
+            run_command: vec![bin_path.clone()],
+            login_command: vec![bin_path],
+            install: InstallDefinition {
+                install_type: InstallType::Npm,
+                depends_on: vec!["node".to_string()],
+                archive_name: None,
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: None,
+            },
+        }
+    };
+
+    custom_file.tools.push(tool);
+
+    // Save custom tools atomically
+    let config_dir = app.path("config");
+    fs::create_dir_all(&config_dir)?;
+    let temp_path = config_dir.join("custom-tools.json.tmp");
+    fs::write(&temp_path, serde_json::to_string_pretty(&custom_file)?)?;
+    if custom_path.exists() {
+        fs::remove_file(&custom_path)?;
+    }
+    fs::rename(&temp_path, &custom_path)?;
+
+    Ok(())
+}
+
+pub fn delete_custom_tool(app: &AppState, tool_id: String) -> Result<(), AppError> {
+    if !tool_id.starts_with("custom-") {
+        return Err(AppError::Message("只能删除自定义工具".to_string()));
+    }
+
+    // First uninstall it if it's installed (removes files)
+    let manifest = load_manifest(app)?;
+    if let Some(tool) = manifest.tools.iter().find(|t| t.id == tool_id) {
+        let _ = uninstall_tool(app, tool);
+    }
+
+    // Load custom tools file
+    let custom_path = app.path(CUSTOM_TOOLS_PATH);
+    if custom_path.exists() {
+        let raw = fs::read_to_string(&custom_path)?;
+        let mut custom_file = serde_json::from_str::<CustomToolsFile>(&raw).unwrap_or_default();
+        let original_len = custom_file.tools.len();
+        custom_file.tools.retain(|t| t.id != tool_id);
+        if custom_file.tools.len() < original_len {
+            fs::write(&custom_path, serde_json::to_string_pretty(&custom_file)?)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1726,7 +1995,7 @@ mod tests {
     #[test]
     fn dashboard_reports_missing_required_tool() {
         let (_temp, app) = fixture();
-        let dashboard = get_dashboard(&app).unwrap();
+        let dashboard = get_dashboard(&app, false).unwrap();
         assert_eq!(dashboard.tools.len(), 1);
         assert_eq!(dashboard.tools[0].status, ToolStatus::Missing);
         assert_eq!(dashboard.health.summary, HealthSummary::Warning);
@@ -1737,7 +2006,7 @@ mod tests {
         let (_temp, app) = fixture();
         fs::create_dir_all(app.path("apps/node")).unwrap();
         fs::write(app.path("apps/node/node.exe"), "").unwrap();
-        let dashboard = get_dashboard(&app).unwrap();
+        let dashboard = get_dashboard(&app, false).unwrap();
         assert_eq!(dashboard.tools[0].status, ToolStatus::Ready);
     }
 
@@ -1745,137 +2014,6 @@ mod tests {
     fn display_path_removes_windows_extended_prefix() {
         let path = PathBuf::from(r"\\?\E:\kit\config");
         assert_eq!(display_path(&path), r"E:\kit\config");
-    }
-
-    #[test]
-    fn child_process_path_removes_windows_extended_prefix() {
-        let path = PathBuf::from(r"\\?\F:\BXAI\cache\downloads\node.zip");
-        assert_eq!(
-            child_process_path(&path),
-            r"F:\BXAI\cache\downloads\node.zip"
-        );
-    }
-
-    #[test]
-    fn terminal_command_line_uses_cmd_call_without_backslash_escaped_quotes() {
-        let exe = PathBuf::from(r"F:\BXAI\tools\codex\node_modules\.bin\codex.cmd");
-        let command = vec![
-            "node_modules/.bin/codex.cmd".to_string(),
-            "login".to_string(),
-        ];
-        let line = terminal_command_line(&exe, &command);
-        assert_eq!(
-            line,
-            r#"call "F:\BXAI\tools\codex\node_modules\.bin\codex.cmd" login"#
-        );
-        assert!(!line.contains(r#"\""#));
-    }
-
-    #[test]
-    fn terminal_command_line_quotes_arguments_with_spaces() {
-        let exe = PathBuf::from(r"F:\BXAI\tools\demo tool\demo.cmd");
-        let command = vec!["demo.cmd".to_string(), "hello world".to_string()];
-        assert_eq!(
-            terminal_command_line(&exe, &command),
-            r#"call "F:\BXAI\tools\demo tool\demo.cmd" "hello world""#
-        );
-    }
-
-    #[test]
-    fn terminal_launcher_keeps_shell_after_tool_exit() {
-        let (_temp, app) = fixture();
-        bootstrap_kit(&app).unwrap();
-        let tool = ToolDefinition {
-            id: "codex".to_string(),
-            name: "Codex CLI".to_string(),
-            kind: ToolKind::AiCli,
-            required: false,
-            base_path: "tools/codex".to_string(),
-            package_name: None,
-            version_command: Vec::new(),
-            host_version_command: Vec::new(),
-            bin_paths: vec!["codex.cmd".to_string()],
-            run_command: vec!["codex.cmd".to_string()],
-            login_command: Vec::new(),
-            install: InstallDefinition {
-                install_type: InstallType::Command,
-                depends_on: Vec::new(),
-                archive_name: None,
-                installer_type: None,
-                command: None,
-                urls: BTreeMap::new(),
-            },
-        };
-        let exe = app.path("tools/codex/codex.cmd");
-        fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        fs::write(&exe, "@echo off\r\n").unwrap();
-        let launcher =
-            write_terminal_launcher(&app, &tool, &exe, &["codex.cmd".to_string()], "运行").unwrap();
-        let content = fs::read_to_string(launcher).unwrap();
-        assert!(content.contains("exited with code"));
-        assert!(content.contains("This terminal is still using the selected workspace directory."));
-    }
-
-    #[test]
-    fn custom_tools_are_merged_into_dashboard_manifest() {
-        let (_temp, app) = fixture();
-        bootstrap_kit(&app).unwrap();
-        let request = AddNpmToolRequest {
-            name: "Demo CLI".to_string(),
-            package_name: "demo-cli".to_string(),
-            bin_name: "demo".to_string(),
-            login_args: None,
-            install_now: false,
-        };
-        add_custom_npm_tool(&app, request).unwrap();
-        let manifest = load_manifest(&app).unwrap();
-        assert!(manifest
-            .tools
-            .iter()
-            .any(|tool| tool.id == "custom-demo-cli"));
-    }
-
-    #[test]
-    fn parse_command_line_handles_quoted_arguments() {
-        assert_eq!(
-            parse_command_line(r#"npm install "demo cli""#).unwrap(),
-            vec!["npm", "install", "demo cli"]
-        );
-    }
-
-    #[test]
-    fn npm_bin_names_for_string_bin_uses_package_basename() {
-        let bin = serde_json::Value::String("dist/index.js".to_string());
-        assert_eq!(
-            npm_bin_names(Some(&bin), "@scope/demo-cli"),
-            vec!["demo-cli"]
-        );
-    }
-
-    #[test]
-    fn safe_child_path_rejects_paths_outside_root() {
-        let (temp, app) = fixture();
-        let outside = temp.path().parent().unwrap().join("outside-tool");
-        assert!(ensure_safe_child_path(&app, &outside, "工具安装目录").is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn archive_install_failure_preserves_existing_tool() {
-        let (_temp, app) = fixture();
-        bootstrap_kit(&app).unwrap();
-        let existing_tool = app.path("apps/node/node.exe");
-        fs::create_dir_all(existing_tool.parent().unwrap()).unwrap();
-        fs::write(&existing_tool, "existing").unwrap();
-        fs::write(app.path("cache/downloads/node.zip"), "not a zip").unwrap();
-
-        let manifest = load_manifest(&app).unwrap();
-        let settings = load_settings(&app).unwrap();
-        let result = install_archive_tool(&app, &manifest, &settings, &manifest.tools[0]).unwrap();
-
-        assert!(!result.success);
-        assert!(existing_tool.exists());
-        assert!(!app.path("cache/staging/node-install").exists());
     }
 
     #[test]

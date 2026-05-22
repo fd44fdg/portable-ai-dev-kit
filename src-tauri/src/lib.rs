@@ -1,112 +1,167 @@
 mod portable;
 
 use portable::{
-    add_custom_command_tool as add_custom_command_tool_impl,
-    add_custom_npm_tool as add_custom_npm_tool_impl, bootstrap_kit, check_health, get_dashboard,
-    inspect_npm_package as inspect_npm_package_impl, login_tool as open_tool_login, run_tool,
-    search_npm_packages as search_npm_packages_impl, tool_action, AddCommandToolRequest,
-    AddNpmToolRequest, AppError, AppState, Dashboard, HealthReport, NpmPackageCandidate,
-    NpmPackageSuggestion, ToolActionRequest, ToolCommandResult,
+    bootstrap_kit, check_health, get_dashboard, get_marketplace_tools,
+    login_tool as open_tool_login, run_tool, tool_action, AppError, AppState, Dashboard,
+    HealthReport, MarketplaceTool, ToolActionRequest, ToolCommandResult,
 };
 
 #[tauri::command]
-fn bootstrap() -> Result<Dashboard, AppError> {
-    let app = AppState::discover()?;
-    bootstrap_kit(&app)?;
-    get_dashboard(&app)
+async fn bootstrap(force: Option<bool>) -> Result<Dashboard, AppError> {
+    tokio::task::spawn_blocking(move || -> Result<Dashboard, AppError> {
+        let app = AppState::discover()?;
+        bootstrap_kit(&app)?;
+        get_dashboard(&app, force.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
 }
 
 #[tauri::command]
-fn dashboard() -> Result<Dashboard, AppError> {
-    let app = AppState::discover()?;
-    get_dashboard(&app)
+async fn dashboard(force: Option<bool>) -> Result<Dashboard, AppError> {
+    tokio::task::spawn_blocking(move || -> Result<Dashboard, AppError> {
+        let app = AppState::discover()?;
+        get_dashboard(&app, force.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
 }
 
 #[tauri::command]
-fn health() -> Result<HealthReport, AppError> {
-    let app = AppState::discover()?;
-    check_health(&app)
+async fn health() -> Result<HealthReport, AppError> {
+    tokio::task::spawn_blocking(|| -> Result<HealthReport, AppError> {
+        let app = AppState::discover()?;
+        check_health(&app)
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
 }
 
 #[tauri::command]
 async fn install_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
-    run_tool_action(tool_id, "install").await
+    tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
+        let app = AppState::discover()?;
+        tool_action(&app, ToolActionRequest::new(tool_id, "install"))
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
 }
 
 #[tauri::command]
 async fn uninstall_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
-    run_tool_action(tool_id, "uninstall").await
+    tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
+        let app = AppState::discover()?;
+        tool_action(&app, ToolActionRequest::new(tool_id, "uninstall"))
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
 }
 
 #[tauri::command]
 async fn update_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
-    run_tool_action(tool_id, "update").await
-}
-
-#[tauri::command]
-fn launch_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
-    let app = AppState::discover()?;
-    run_tool(&app, &tool_id)
-}
-
-#[tauri::command]
-fn login_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
-    let app = AppState::discover()?;
-    open_tool_login(&app, &tool_id)
-}
-
-#[tauri::command]
-async fn add_custom_npm_tool(request: AddNpmToolRequest) -> Result<ToolCommandResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
         let app = AppState::discover()?;
-        add_custom_npm_tool_impl(&app, request)
+        tool_action(&app, ToolActionRequest::new(tool_id, "update"))
     })
     .await
-    .map_err(|error| AppError::Message(format!("后台任务执行失败：{}", error)))?
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
 }
 
 #[tauri::command]
-async fn add_custom_command_tool(
-    request: AddCommandToolRequest,
-) -> Result<ToolCommandResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let app = AppState::discover()?;
-        add_custom_command_tool_impl(&app, request)
-    })
-    .await
-    .map_err(|error| AppError::Message(format!("后台任务执行失败：{}", error)))?
-}
-
-#[tauri::command]
-async fn search_npm_packages(query: String) -> Result<Vec<NpmPackageCandidate>, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let app = AppState::discover()?;
-        search_npm_packages_impl(&app, &query)
-    })
-    .await
-    .map_err(|error| AppError::Message(format!("后台任务执行失败：{}", error)))?
-}
-
-#[tauri::command]
-async fn inspect_npm_package(package_name: String) -> Result<NpmPackageSuggestion, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let app = AppState::discover()?;
-        inspect_npm_package_impl(&app, &package_name)
-    })
-    .await
-    .map_err(|error| AppError::Message(format!("后台任务执行失败：{}", error)))?
-}
-
-async fn run_tool_action(
+async fn launch_tool(
     tool_id: String,
-    action: &'static str,
+    workspace_dir: Option<String>,
 ) -> Result<ToolCommandResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
         let app = AppState::discover()?;
-        tool_action(&app, ToolActionRequest::new(tool_id, action))
+        run_tool(&app, &tool_id, workspace_dir)
     })
     .await
-    .map_err(|error| AppError::Message(format!("后台任务执行失败：{}", error)))?
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
+async fn login_tool(
+    tool_id: String,
+    workspace_dir: Option<String>,
+) -> Result<ToolCommandResult, AppError> {
+    tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
+        let app = AppState::discover()?;
+        open_tool_login(&app, &tool_id, workspace_dir)
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
+async fn select_workspace_dialog() -> Result<Option<String>, AppError> {
+    tokio::task::spawn_blocking(|| -> Result<Option<String>, AppError> {
+        Ok(rfd::FileDialog::new()
+            .set_title("选择 AI CLI 工作目录")
+            .pick_folder()
+            .map(|path| path.display().to_string()))
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
+async fn add_custom_tool(
+    name: String,
+    install_type: String,
+    package_name: Option<String>,
+    script_url: Option<String>,
+    bin_name: Option<String>,
+) -> Result<Dashboard, AppError> {
+    tokio::task::spawn_blocking(move || -> Result<Dashboard, AppError> {
+        let app = AppState::discover()?;
+        portable::add_custom_tool(
+            &app,
+            name,
+            &install_type,
+            package_name,
+            script_url,
+            bin_name,
+        )?;
+        get_dashboard(&app, false)
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
+async fn delete_custom_tool(tool_id: String) -> Result<Dashboard, AppError> {
+    tokio::task::spawn_blocking(move || -> Result<Dashboard, AppError> {
+        let app = AppState::discover()?;
+        portable::delete_custom_tool(&app, tool_id)?;
+        get_dashboard(&app, false)
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
+async fn marketplace_tools() -> Result<Vec<MarketplaceTool>, AppError> {
+    tokio::task::spawn_blocking(|| -> Result<Vec<MarketplaceTool>, AppError> {
+        let app = AppState::discover()?;
+        get_marketplace_tools(&app)
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
+async fn install_marketplace_tool(
+    id: String,
+    name: String,
+    package_name: String,
+) -> Result<ToolCommandResult, AppError> {
+    tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
+        let app = AppState::discover()?;
+        portable::install_marketplace_tool(&app, id, name, package_name)
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
 }
 
 pub fn run() {
@@ -120,10 +175,11 @@ pub fn run() {
             update_tool,
             launch_tool,
             login_tool,
-            add_custom_npm_tool,
-            add_custom_command_tool,
-            search_npm_packages,
-            inspect_npm_package
+            select_workspace_dialog,
+            add_custom_tool,
+            delete_custom_tool,
+            marketplace_tools,
+            install_marketplace_tool
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Portable AI Dev Kit");

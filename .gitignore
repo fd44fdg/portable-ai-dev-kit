@@ -7,10 +7,26 @@ cache/
 logs/
 state/
 workspace/
-tools/*/node_modules/
-tools/*/package-lock.json
-tools/*/package.json
+tools/
 config/local.json
+config/custom-tools.json
 tasks/
 old-portable-ai-dev-kit/
+Microsoft/
+.antigravitycli/
+.planning/
 1.png
+
+# Build artifacts and large files
+*.exe
+*.tar.gz
+*.zip
+test.tar.gz
+Portable-AI-Dev-Kit.exe
+
+# OS / editor
+Thumbs.db
+.DS_Store
+*.swp
+*.bak
+*.tmp
