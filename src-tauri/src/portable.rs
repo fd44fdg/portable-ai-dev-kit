@@ -662,7 +662,22 @@ fn install_npm_tool(
         )?;
     }
 
-    let mut command = Command::new(&npm);
+    let mut command = if npm
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("js"))
+        .unwrap_or(false)
+    {
+        // npm-cli.js is a JS file — Windows can't execute it directly.
+        // Use the bundled node.exe to run it instead.
+        let node_exe = find_existing_path(&node_root, &["node.exe"])
+            .ok_or_else(|| AppError::Message("Node 可执行文件未找到".to_string()))?;
+        let mut cmd = Command::new(node_exe);
+        cmd.arg(&npm);
+        cmd
+    } else {
+        Command::new(&npm)
+    };
     command
         .arg("install")
         .arg("--prefix")
@@ -1382,9 +1397,25 @@ fn load_manifest(app: &AppState) -> Result<Manifest, AppError> {
 
     let custom_path = app.path(CUSTOM_TOOLS_PATH);
     if custom_path.exists() {
-        if let Ok(custom_raw) = fs::read_to_string(&custom_path) {
-            if let Ok(custom_file) = serde_json::from_str::<CustomToolsFile>(&custom_raw) {
-                manifest.tools.extend(custom_file.tools);
+        match fs::read_to_string(&custom_path) {
+            Ok(custom_raw) => match serde_json::from_str::<CustomToolsFile>(&custom_raw) {
+                Ok(custom_file) => manifest.tools.extend(custom_file.tools),
+                Err(error) => {
+                    eprintln!(
+                        "warning: 无法解析 {}: {}; 将忽略自定义工具列表",
+                        display_path(&custom_path),
+                        error
+                    );
+                    let backup = custom_path.with_extension("json.corrupt");
+                    let _ = fs::copy(&custom_path, &backup);
+                }
+            },
+            Err(error) => {
+                eprintln!(
+                    "warning: 无法读取 {}: {}",
+                    display_path(&custom_path),
+                    error
+                );
             }
         }
     }
@@ -1519,6 +1550,17 @@ fn find_existing_path<T: AsRef<str>>(base: &Path, relatives: &[T]) -> Option<Pat
         }
         if let Ok(children) = fs::read_dir(base) {
             for child in children.flatten() {
+                // Skip symlinks/junctions to avoid infinite loops and
+                // accidentally resolving outside the portable tree (e.g.
+                // Windows compatibility junctions like "Application Data" →
+                // "AppData/Roaming").
+                if child
+                    .file_type()
+                    .map(|t| t.is_symlink())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let nested = child.path().join(relative.as_ref().replace('/', "\\"));
                 if nested.exists() {
                     return Some(nested);
@@ -1750,7 +1792,7 @@ pub fn add_custom_tool(
     package_name: Option<String>,
     script_url: Option<String>,
     bin_name: Option<String>,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     // Sanitize name to generate a valid tool ID (ASCII-only to avoid
     // codepage issues in Windows .bat / cmd execution).
     let trimmed_name = name.trim();
@@ -1786,6 +1828,7 @@ pub fn add_custom_tool(
         }
     }
     let tool_id = format!("custom-{}", id_name);
+    let new_tool_id = tool_id.clone();
 
     // Load existing manifest to check for duplicate IDs
     let manifest = load_manifest(app)?;
@@ -1826,9 +1869,11 @@ pub fn add_custom_tool(
             return Err(AppError::Message("脚本 URL 不能为空".to_string()));
         }
         let url_lower = script_url_val.to_lowercase();
-        if !(url_lower.starts_with("https://") || url_lower.starts_with("http://")) {
+        let is_local_http = url_lower.starts_with("http://localhost")
+            || url_lower.starts_with("http://127.0.0.1");
+        if !(url_lower.starts_with("https://") || is_local_http) {
             return Err(AppError::Message(
-                "脚本 URL 必须以 http:// 或 https:// 开头".to_string(),
+                "脚本 URL 必须使用 HTTPS（仅 localhost / 127.0.0.1 允许 HTTP）".to_string(),
             ));
         }
 
@@ -1917,7 +1962,7 @@ pub fn add_custom_tool(
     }
     fs::rename(&temp_path, &custom_path)?;
 
-    Ok(())
+    Ok(new_tool_id)
 }
 
 pub fn delete_custom_tool(app: &AppState, tool_id: String) -> Result<(), AppError> {
@@ -1925,10 +1970,17 @@ pub fn delete_custom_tool(app: &AppState, tool_id: String) -> Result<(), AppErro
         return Err(AppError::Message("只能删除自定义工具".to_string()));
     }
 
-    // First uninstall it if it's installed (removes files)
+    // First uninstall it if it's installed (removes files). We do NOT abort
+    // deletion if uninstall fails (the user explicitly chose to delete), but
+    // surface the error to stderr so it ends up in the .log for debugging.
     let manifest = load_manifest(app)?;
     if let Some(tool) = manifest.tools.iter().find(|t| t.id == tool_id) {
-        let _ = uninstall_tool(app, tool);
+        if let Err(error) = uninstall_tool(app, tool) {
+            eprintln!(
+                "warning: 删除自定义工具 {} 时清理文件失败: {}",
+                tool_id, error
+            );
+        }
     }
 
     // Load custom tools file

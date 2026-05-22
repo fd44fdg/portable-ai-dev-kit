@@ -81,6 +81,29 @@ type MarketplaceTool = {
   installed: boolean;
 };
 
+type AddCustomToolResult = {
+  dashboard: Dashboard;
+  newToolId: string;
+};
+
+function extractErrorMessage(error: unknown): string {
+  if (error == null) return "未知错误";
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+type LogEntry = { ts: string; text: string };
+const MAX_LOG_ENTRIES = 80;
+function nowStamp(): string {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+}
+
 const statusText: Record<ToolStatus, string> = {
   ready: "可用",
   missing: "未安装",
@@ -97,7 +120,20 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [activeTool, setActiveTool] = useState<string>("");
   const [busyTool, setBusyTool] = useState<string | null>(null);
-  const [log, setLog] = useState<string>("正在启动便携环境控制台...");
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([
+    { ts: nowStamp(), text: "正在启动便携环境控制台..." },
+  ]);
+  const setLog = useCallback((text: string) => {
+    if (!text) return;
+    setLogEntries((prev) => {
+      const next = [...prev, { ts: nowStamp(), text }];
+      return next.length > MAX_LOG_ENTRIES ? next.slice(next.length - MAX_LOG_ENTRIES) : next;
+    });
+  }, []);
+  const logText = useMemo(
+    () => logEntries.map((entry) => `[${entry.ts}] ${entry.text}`).join("\n\n"),
+    [logEntries],
+  );
   const [startupError, setStartupError] = useState<string | null>(null);
 
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
@@ -136,7 +172,7 @@ function App() {
     bootstrapStartedRef.current = true;
     load(false).catch((error) => {
       if (!isMountedRef.current) return;
-      const message = String(error);
+      const message = extractErrorMessage(error);
       setStartupError(message);
       setLog(message);
     });
@@ -148,7 +184,7 @@ function App() {
       await load(true, true);
       setLog("状态已刷新");
     } catch (error) {
-      setLog(`刷新失败: ${String(error)}`);
+      setLog(`刷新失败: ${extractErrorMessage(error)}`);
     }
   }, [load]);
 
@@ -181,10 +217,11 @@ function App() {
           : { toolId };
       const result = await invoke<ToolCommandResult>(action, args);
       if (!isMountedRef.current) return;
-      setLog([result.message, result.output].filter(Boolean).join("\n\n"));
+      const combined = [result.message, result.output].filter(Boolean).join("\n");
+      if (combined) setLog(combined);
       await load(true);
     } catch (error) {
-      if (isMountedRef.current) setLog(String(error));
+      if (isMountedRef.current) setLog(extractErrorMessage(error));
     } finally {
       runActionInFlightRef.current = false;
       if (isMountedRef.current) setBusyTool(null);
@@ -216,14 +253,16 @@ function App() {
   async function openMarketplace() {
     setShowMarketplace(true);
     setMarketplaceSearch("");
+    setMarketplaceTools([]);
     setMarketplaceLoading(true);
     try {
       const tools = await invoke<MarketplaceTool[]>("marketplace_tools");
+      if (!isMountedRef.current) return;
       setMarketplaceTools(tools);
     } catch (error) {
-      setLog(String(error));
+      if (isMountedRef.current) setLog(extractErrorMessage(error));
     } finally {
-      setMarketplaceLoading(false);
+      if (isMountedRef.current) setMarketplaceLoading(false);
     }
   }
 
@@ -236,28 +275,40 @@ function App() {
         name: tool.name,
         packageName: tool.packageName,
       });
-      setLog([result.message, result.output].filter(Boolean).join("\n\n"));
+      if (!isMountedRef.current) return;
+      const combined = [result.message, result.output].filter(Boolean).join("\n");
+      if (combined) setLog(combined);
+      if (result.success) {
+        setMarketplaceTools((prev) =>
+          prev.map((t) => (t.id === tool.id ? { ...t, installed: true } : t)),
+        );
+      }
       const tools = await invoke<MarketplaceTool[]>("marketplace_tools");
+      if (!isMountedRef.current) return;
       setMarketplaceTools(tools);
       await load(true);
     } catch (error) {
-      setLog(String(error));
+      if (isMountedRef.current) setLog(extractErrorMessage(error));
     } finally {
-      setMarketplaceBusy(null);
+      if (isMountedRef.current) setMarketplaceBusy(null);
     }
   }
 
   async function handleAddCustomTool(e: React.FormEvent) {
     e.preventDefault();
     let name = customName.trim();
-    
+
     if (installType === "npm") {
       if (!customPackage.trim()) {
         setAddError("请输入 npm 包名");
         return;
       }
       if (!name) {
-        name = customPackage.trim().split('/').pop()?.split('@')[0] || "custom-tool";
+        const pkg = customPackage.trim();
+        const tail = pkg.includes("/")
+          ? pkg.split("/").pop() || pkg
+          : pkg.replace(/^@[^/]+\//, "");
+        name = (tail.split("@").filter(Boolean)[0] || "").trim() || "custom-tool";
       }
     } else {
       if (!customScriptUrl.trim()) {
@@ -276,17 +327,17 @@ function App() {
 
     setAddError(null);
     try {
-      const nextDashboard = await invoke<Dashboard>("add_custom_tool", {
+      const result = await invoke<AddCustomToolResult>("add_custom_tool", {
         name,
         installType,
         packageName: installType === "npm" ? customPackage.trim() : null,
         scriptUrl: installType === "powershell-script" ? customScriptUrl.trim() : null,
         binName: installType === "powershell-script" ? customBinName.trim() || null : null,
       });
-      setDashboard(nextDashboard);
-      const newToolId = `custom-${name.toLowerCase().replace(/[^a-z0-9-_]/g, "")}`;
-      if (nextDashboard.tools.some(t => t.id === newToolId)) {
-        setActiveTool(newToolId);
+      if (!isMountedRef.current) return;
+      setDashboard(result.dashboard);
+      if (result.newToolId && result.dashboard.tools.some((t) => t.id === result.newToolId)) {
+        setActiveTool(result.newToolId);
       }
       setShowAddModal(false);
       setCustomName("");
@@ -295,9 +346,15 @@ function App() {
       setCustomBinName("");
       setLog(`已成功添加自定义工具：${name}`);
     } catch (error) {
-      setAddError(String(error));
+      if (isMountedRef.current) setAddError(extractErrorMessage(error));
     }
   }
+
+  const logRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [logText]);
 
   if (!dashboard || !active) {
     return (
@@ -308,6 +365,25 @@ function App() {
           <div>
             <p>{startupError ? "便携环境加载失败" : "正在加载便携环境"}</p>
             {startupError && <small>{startupError}</small>}
+            {startupError && (
+              <button
+                type="button"
+                className="primary"
+                style={{ marginTop: 12 }}
+                onClick={() => {
+                  setStartupError(null);
+                  setLog("正在重试加载便携环境...");
+                  load(false).catch((error) => {
+                    if (!isMountedRef.current) return;
+                    const message = extractErrorMessage(error);
+                    setStartupError(message);
+                    setLog(message);
+                  });
+                }}
+              >
+                <RefreshCw size={17} /> 重试
+              </button>
+            )}
           </div>
         </section>
       </main>
@@ -415,13 +491,15 @@ function App() {
                 disabled={busyTool === active.id}
                 onClick={() => runAction("install_tool", active.id)}
               >
-                <Download size={17} /> 安装
+                {busyTool === active.id ? <Activity className="spin" size={17} /> : <Download size={17} />}
+                {busyTool === active.id ? "安装中..." : "安装"}
               </button>
               <button
                 disabled={busyTool === active.id || active.status === "missing"}
                 onClick={() => runAction("update_tool", active.id)}
               >
-                <RefreshCw size={17} /> 更新
+                {busyTool === active.id ? <Activity className="spin" size={17} /> : <RefreshCw size={17} />}
+                {busyTool === active.id ? "处理中..." : "更新"}
               </button>
               <button
                 disabled={busyTool === active.id || active.status === "missing" || active.kind !== "ai-cli"}
@@ -440,7 +518,8 @@ function App() {
                 disabled={busyTool === active.id || active.status === "missing"}
                 onClick={() => runAction("uninstall_tool", active.id)}
               >
-                <Trash2 size={17} /> 卸载
+                {busyTool === active.id ? <Activity className="spin" size={17} /> : <Trash2 size={17} />}
+                {busyTool === active.id ? "处理中..." : "卸载"}
               </button>
               {active.id.startsWith("custom-") && (
                 <button
@@ -463,7 +542,7 @@ function App() {
                       setActiveTool(nextDashboard.tools[0]?.id ?? "");
                       setLog(`已成功删除自定义工具：${active.name}`);
                     } catch (error) {
-                      if (isMountedRef.current) setLog(String(error));
+                      if (isMountedRef.current) setLog(extractErrorMessage(error));
                     } finally {
                       if (isMountedRef.current) setBusyTool(null);
                     }
@@ -502,7 +581,7 @@ function App() {
             <span>操作日志</span>
             <ExternalLink size={16} />
           </div>
-          <pre>{log}</pre>
+          <pre ref={logRef}>{logText}</pre>
         </section>
       </section>
 
@@ -537,7 +616,7 @@ function App() {
                     required
                     placeholder="e.g. freebuff"
                     value={customPackage}
-                    onChange={(e) => setCustomPackage(e.target.value)}
+                    onChange={(e) => { setCustomPackage(e.target.value); if (addError) setAddError(null); }}
                     autoFocus
                   />
                 </div>
@@ -550,7 +629,7 @@ function App() {
                       required
                       placeholder="https://example.com/install.ps1"
                       value={customScriptUrl}
-                      onChange={(e) => setCustomScriptUrl(e.target.value)}
+                      onChange={(e) => { setCustomScriptUrl(e.target.value); if (addError) setAddError(null); }}
                       autoFocus
                     />
                   </div>
@@ -558,9 +637,9 @@ function App() {
                     <label>可执行二进制文件名 (可选，例如: agy.exe)</label>
                     <input
                       type="text"
-                      placeholder="留空则自动从工具名称推断"
+                      placeholder="留空则自动从 URL / 包名推断"
                       value={customBinName}
-                      onChange={(e) => setCustomBinName(e.target.value)}
+                      onChange={(e) => { setCustomBinName(e.target.value); if (addError) setAddError(null); }}
                     />
                   </div>
                 </>
@@ -572,7 +651,7 @@ function App() {
                   type="text"
                   placeholder="e.g. Antigravity"
                   value={customName}
-                  onChange={(e) => setCustomName(e.target.value)}
+                  onChange={(e) => { setCustomName(e.target.value); if (addError) setAddError(null); }}
                 />
               </div>
 

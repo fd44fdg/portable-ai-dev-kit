@@ -5,6 +5,14 @@ use portable::{
     login_tool as open_tool_login, run_tool, tool_action, AppError, AppState, Dashboard,
     HealthReport, MarketplaceTool, ToolActionRequest, ToolCommandResult,
 };
+use serde::Serialize;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddCustomToolResult {
+    dashboard: Dashboard,
+    new_tool_id: String,
+}
 
 #[tauri::command]
 async fn bootstrap(force: Option<bool>) -> Result<Dashboard, AppError> {
@@ -95,14 +103,21 @@ async fn login_tool(
 
 #[tauri::command]
 async fn select_workspace_dialog() -> Result<Option<String>, AppError> {
-    tokio::task::spawn_blocking(|| -> Result<Option<String>, AppError> {
-        Ok(rfd::FileDialog::new()
+    // rfd on Windows requires COM/STA initialization on the calling thread.
+    // tokio's blocking pool reuses threads, so the COM state is unpredictable.
+    // Spawn a fresh OS thread so rfd can manage COM init from a clean slate.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = rfd::FileDialog::new()
             .set_title("选择 AI CLI 工作目录")
             .pick_folder()
-            .map(|path| path.display().to_string()))
-    })
-    .await
-    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+            .map(|path| path.display().to_string());
+        let _ = tx.send(result);
+    });
+    tokio::task::spawn_blocking(move || rx.recv().unwrap_or(None))
+        .await
+        .map(Ok)
+        .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
 }
 
 #[tauri::command]
@@ -112,10 +127,10 @@ async fn add_custom_tool(
     package_name: Option<String>,
     script_url: Option<String>,
     bin_name: Option<String>,
-) -> Result<Dashboard, AppError> {
-    tokio::task::spawn_blocking(move || -> Result<Dashboard, AppError> {
+) -> Result<AddCustomToolResult, AppError> {
+    tokio::task::spawn_blocking(move || -> Result<AddCustomToolResult, AppError> {
         let app = AppState::discover()?;
-        portable::add_custom_tool(
+        let new_tool_id = portable::add_custom_tool(
             &app,
             name,
             &install_type,
@@ -123,7 +138,11 @@ async fn add_custom_tool(
             script_url,
             bin_name,
         )?;
-        get_dashboard(&app, false)
+        let dashboard = get_dashboard(&app, false)?;
+        Ok(AddCustomToolResult {
+            dashboard,
+            new_tool_id,
+        })
     })
     .await
     .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
