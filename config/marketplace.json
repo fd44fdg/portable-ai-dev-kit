@@ -1,0 +1,52 @@
+{
+  "tools": [
+    {
+      "id": "codebuff",
+      "name": "Codebuff",
+      "description": "AI驱动的对话式编程助手，在终端中通过自然语言与AI协作编码",
+      "packageName": "codebuff",
+      "category": "AI CLI",
+      "homepage": "https://codebuff.com"
+    },
+    {
+      "id": "freebuff",
+      "name": "freebuff",
+      "description": "免费开源的AI CLI工具箱，支持多种AI模型的命令行交互",
+      "packageName": "freebuff",
+      "category": "AI CLI",
+      "homepage": "https://deerflow.tech"
+    },
+    {
+      "id": "github-copilot",
+      "name": "GitHub Copilot CLI",
+      "description": "GitHub官方AI命令行助手，在终端中获取AI驱动的代码建议和解释",
+      "packageName": "@githubnext/github-copilot-cli",
+      "category": "AI CLI",
+      "homepage": "https://github.com/githubnext/github-copilot-cli"
+    },
+    {
+      "id": "claude",
+      "name": "Claude Code",
+      "description": "Anthropic 官方AI编程助手（已在工具清单中）",
+      "packageName": "@anthropic-ai/claude-code",
+      "category": "AI CLI",
+      "homepage": "https://docs.anthropic.com/en/docs/claude-code"
+    },
+    {
+      "id": "codex",
+      "name": "Codex CLI",
+      "description": "OpenAI 官方AI编程助手（已在工具清单中）",
+      "packageName": "@openai/codex",
+      "category": "AI CLI",
+      "homepage": "https://openai.com/index/codex-cli"
+    },
+    {
+      "id": "antigravity",
+      "name": "Antigravity CLI",
+      "description": "Google 官方AI CLI工具（已在工具清单中）",
+      "packageName": "antigravity",
+      "category": "AI CLI",
+      "homepage": "https://antigravity.google"
+    }
+  ]
+}

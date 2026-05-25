@@ -1,9 +1,9 @@
 mod portable;
 
 use portable::{
-    bootstrap_kit, check_health, get_dashboard, get_marketplace_tools,
+    bootstrap_kit, check_health, export_diagnostics, get_dashboard, get_marketplace_tools,
     login_tool as open_tool_login, run_tool, tool_action, AppError, AppState, Dashboard,
-    HealthReport, MarketplaceTool, ToolActionRequest, ToolCommandResult,
+    DiagnosticsReport, HealthReport, MarketplaceTool, ToolActionRequest, ToolCommandResult,
 };
 use serde::Serialize;
 
@@ -40,6 +40,16 @@ async fn health() -> Result<HealthReport, AppError> {
     tokio::task::spawn_blocking(|| -> Result<HealthReport, AppError> {
         let app = AppState::discover()?;
         check_health(&app)
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
+async fn export_diagnostics_report() -> Result<DiagnosticsReport, AppError> {
+    tokio::task::spawn_blocking(|| -> Result<DiagnosticsReport, AppError> {
+        let app = AppState::discover()?;
+        export_diagnostics(&app)
     })
     .await
     .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
@@ -102,16 +112,17 @@ async fn login_tool(
 }
 
 #[tauri::command]
-async fn select_workspace_dialog() -> Result<Option<String>, AppError> {
+async fn select_workspace_dialog(default_dir: Option<String>) -> Result<Option<String>, AppError> {
     // rfd on Windows requires COM/STA initialization on the calling thread.
     // tokio's blocking pool reuses threads, so the COM state is unpredictable.
     // Spawn a fresh OS thread so rfd can manage COM init from a clean slate.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = rfd::FileDialog::new()
-            .set_title("选择 AI CLI 工作目录")
-            .pick_folder()
-            .map(|path| path.display().to_string());
+        let mut dialog = rfd::FileDialog::new().set_title("选择 AI CLI 工作目录");
+        if let Some(dir) = default_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let result = dialog.pick_folder().map(|path| path.display().to_string());
         let _ = tx.send(result);
     });
     tokio::task::spawn_blocking(move || rx.recv().unwrap_or(None))
@@ -160,6 +171,20 @@ async fn delete_custom_tool(tool_id: String) -> Result<Dashboard, AppError> {
 }
 
 #[tauri::command]
+async fn save_settings(
+    network_mode: String,
+    workspace_path: String,
+    auto_open_workspace: bool,
+) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let app = AppState::discover()?;
+        portable::save_settings(&app, &network_mode, &workspace_path, auto_open_workspace)
+    })
+    .await
+    .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
 async fn marketplace_tools() -> Result<Vec<MarketplaceTool>, AppError> {
     tokio::task::spawn_blocking(|| -> Result<Vec<MarketplaceTool>, AppError> {
         let app = AppState::discover()?;
@@ -189,6 +214,7 @@ pub fn run() {
             bootstrap,
             dashboard,
             health,
+            export_diagnostics_report,
             install_tool,
             uninstall_tool,
             update_tool,
@@ -197,6 +223,7 @@ pub fn run() {
             select_workspace_dialog,
             add_custom_tool,
             delete_custom_tool,
+            save_settings,
             marketplace_tools,
             install_marketplace_tool
         ])

@@ -16,6 +16,7 @@ static BOOTSTRAPPED_ROOTS: LazyLock<Mutex<HashSet<PathBuf>>> =
 const MANIFEST_PATH: &str = "config/tool-manifest.json";
 const SETTINGS_PATH: &str = "config/app-settings.json";
 const STATE_PATH: &str = "state/tool-state.json";
+const MARKETPLACE_PATH: &str = "config/marketplace.json";
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -95,6 +96,23 @@ pub struct Manifest {
 #[serde(rename_all = "camelCase")]
 pub struct CustomToolsFile {
     pub tools: Vec<ToolDefinition>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketplaceFile {
+    pub tools: Vec<MarketplaceDefinition>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketplaceDefinition {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub package_name: String,
+    pub category: String,
+    pub homepage: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -198,7 +216,9 @@ pub struct PersistedToolState {
 pub struct Dashboard {
     pub root: String,
     pub workspace: String,
+    pub workspace_path: String,
     pub network_mode: String,
+    pub auto_open_workspace: bool,
     pub tools: Vec<ToolView>,
     pub health: HealthReport,
 }
@@ -271,6 +291,12 @@ pub struct ToolCommandResult {
     pub output: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsReport {
+    pub path: String,
+}
+
 pub struct ToolActionRequest {
     tool_id: String,
     action: String,
@@ -291,9 +317,7 @@ pub fn bootstrap_kit(app: &AppState) -> Result<(), AppError> {
     // triggers bootstrap_kit every call, which is visibly slow on network
     // drives.
     {
-        let cache = BOOTSTRAPPED_ROOTS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let cache = BOOTSTRAPPED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
         if cache.contains(&app.root) {
             return Ok(());
         }
@@ -348,7 +372,9 @@ pub fn get_dashboard(app: &AppState, force: bool) -> Result<Dashboard, AppError>
     Ok(Dashboard {
         root: display_path(&app.root),
         workspace: display_path(&app.path(&settings.workspace_path)),
+        workspace_path: settings.workspace_path,
         network_mode: settings.network_mode,
+        auto_open_workspace: settings.auto_open_workspace,
         tools,
         health,
     })
@@ -361,6 +387,24 @@ pub fn check_health(app: &AppState) -> Result<HealthReport, AppError> {
     let report = check_health_with_state(app, &manifest, &settings, &mut state, false)?;
     save_state(app, &state)?;
     Ok(report)
+}
+
+pub fn export_diagnostics(app: &AppState) -> Result<DiagnosticsReport, AppError> {
+    bootstrap_kit(app)?;
+    let dashboard = get_dashboard(app, false)?;
+    let marketplace = load_marketplace(app).unwrap_or_default();
+    let report = render_diagnostics_report(&dashboard, &marketplace);
+    let logs_dir = app.path("logs");
+    fs::create_dir_all(&logs_dir)?;
+    let timestamp = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string())
+        .replace(':', "-");
+    let path = logs_dir.join(format!("diagnostics_{}.md", timestamp));
+    fs::write(&path, report)?;
+    Ok(DiagnosticsReport {
+        path: display_path(&path),
+    })
 }
 
 fn check_health_with_state(
@@ -382,11 +426,19 @@ fn check_health_with_state(
     );
     push_path_check(
         &mut checks,
+        "marketplace",
+        "工具市场配置",
+        &app.path(MARKETPLACE_PATH),
+        false,
+    );
+    push_path_check(
+        &mut checks,
         "workspace",
         "工作目录",
         &app.path(&settings.workspace_path),
         false,
     );
+    checks.extend(package_integrity_checks(app));
 
     if let Ok(metadata) = fs::metadata(&app.root) {
         checks.push(HealthCheck {
@@ -404,6 +456,21 @@ fn check_health_with_state(
             },
         });
     }
+
+    let marketplace_check = validate_marketplace_file(app);
+    checks.push(HealthCheck {
+        id: "marketplace-config".to_string(),
+        label: "工具市场配置".to_string(),
+        status: if marketplace_check.is_ok() {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warning
+        },
+        message: match &marketplace_check {
+            Ok(()) => "配置可读取".to_string(),
+            Err(error) => error.to_string(),
+        },
+    });
 
     for tool in &manifest.tools {
         let view = tool_view(app, tool, state, force)?;
@@ -1224,89 +1291,32 @@ pub struct MarketplaceTool {
 
 pub fn get_marketplace_tools(app: &AppState) -> Result<Vec<MarketplaceTool>, AppError> {
     let manifest = load_manifest(app)?;
-    let _state = load_state(app)?;
+    let marketplace = load_marketplace(app)?;
 
-    let all_tools = vec![
-        MarketplaceTool {
-            id: "codebuff".to_string(),
-            name: "Codebuff".to_string(),
-            description: "AI驱动的对话式编程助手，在终端中通过自然语言与AI协作编码".to_string(),
-            package_name: "codebuff".to_string(),
-            category: "AI CLI".to_string(),
-            homepage: "https://codebuff.com".to_string(),
-            in_manifest: false,
-            installed: false,
-        },
-        MarketplaceTool {
-            id: "freebuff".to_string(),
-            name: "freebuff".to_string(),
-            description: "免费开源的AI CLI工具箱，支持多种AI模型的命令行交互".to_string(),
-            package_name: "freebuff".to_string(),
-            category: "AI CLI".to_string(),
-            homepage: "https://deerflow.tech".to_string(),
-            in_manifest: false,
-            installed: false,
-        },
-        MarketplaceTool {
-            id: "github-copilot".to_string(),
-            name: "GitHub Copilot CLI".to_string(),
-            description: "GitHub官方AI命令行助手，在终端中获取AI驱动的代码建议和解释".to_string(),
-            package_name: "@githubnext/github-copilot-cli".to_string(),
-            category: "AI CLI".to_string(),
-            homepage: "https://github.com/githubnext/github-copilot-cli".to_string(),
-            in_manifest: false,
-            installed: false,
-        },
-        MarketplaceTool {
-            id: "claude".to_string(),
-            name: "Claude Code".to_string(),
-            description: "Anthropic 官方AI编程助手（已在工具清单中）".to_string(),
-            package_name: "@anthropic-ai/claude-code".to_string(),
-            category: "AI CLI".to_string(),
-            homepage: "https://docs.anthropic.com/en/docs/claude-code".to_string(),
-            in_manifest: true,
-            installed: false,
-        },
-        MarketplaceTool {
-            id: "codex".to_string(),
-            name: "Codex CLI".to_string(),
-            description: "OpenAI 官方AI编程助手（已在工具清单中）".to_string(),
-            package_name: "@openai/codex".to_string(),
-            category: "AI CLI".to_string(),
-            homepage: "https://openai.com/index/codex-cli".to_string(),
-            in_manifest: true,
-            installed: false,
-        },
-        MarketplaceTool {
-            id: "antigravity".to_string(),
-            name: "Antigravity CLI".to_string(),
-            description: "Google 官方AI CLI工具（已在工具清单中）".to_string(),
-            package_name: "antigravity".to_string(),
-            category: "AI CLI".to_string(),
-            homepage: "https://antigravity.google".to_string(),
-            in_manifest: true,
-            installed: false,
-        },
-    ];
-
-    let result_tools: Vec<MarketplaceTool> = all_tools
+    let result_tools: Vec<MarketplaceTool> = marketplace
+        .tools
         .into_iter()
-        .map(|mut tool| {
+        .map(|tool| {
             let custom_id = format!("custom-{}", tool.id);
-            // Check if installed via manifest (built-in) or custom-tools
             let in_manifest = manifest.tools.iter().any(|t| t.id == tool.id)
                 || manifest.tools.iter().any(|t| t.id == custom_id);
-            tool.in_manifest = in_manifest;
-            // Check if installed via manifest tool status
-            let is_installed = manifest.tools.iter().any(|t| {
+            let installed = manifest.tools.iter().any(|t| {
                 (t.id == tool.id || t.id == custom_id)
                     && app.path(&t.base_path).exists()
                     && t.bin_paths
                         .iter()
                         .any(|bin| app.path(&t.base_path).join(bin.replace('/', "\\")).exists())
             });
-            tool.installed = is_installed;
-            tool
+            MarketplaceTool {
+                id: tool.id,
+                name: tool.name,
+                description: tool.description,
+                package_name: tool.package_name,
+                category: tool.category,
+                homepage: tool.homepage,
+                in_manifest,
+                installed,
+            }
         })
         .collect();
 
@@ -1442,7 +1452,48 @@ fn load_manifest(app: &AppState) -> Result<Manifest, AppError> {
     Ok(manifest)
 }
 
-fn load_settings(app: &AppState) -> Result<Settings, AppError> {
+fn load_marketplace(app: &AppState) -> Result<MarketplaceFile, AppError> {
+    let path = app.path(MARKETPLACE_PATH);
+    if !path.exists() {
+        return Ok(MarketplaceFile::default());
+    }
+    let raw = fs::read_to_string(path)?;
+    Ok(serde_json::from_str::<MarketplaceFile>(&raw)?)
+}
+
+fn validate_marketplace_file(app: &AppState) -> Result<(), AppError> {
+    let path = app.path(MARKETPLACE_PATH);
+    if !path.exists() {
+        return Ok(());
+    }
+    let marketplace = load_marketplace(app)?;
+    for tool in marketplace.tools {
+        if tool.id.trim().is_empty() {
+            return Err(AppError::Message("工具市场配置包含空 id".to_string()));
+        }
+        if tool.name.trim().is_empty() {
+            return Err(AppError::Message(format!(
+                "工具市场配置 {} 缺少名称",
+                tool.id
+            )));
+        }
+        if tool.package_name.trim().is_empty() {
+            return Err(AppError::Message(format!(
+                "工具市场配置 {} 缺少 packageName",
+                tool.id
+            )));
+        }
+        if tool.homepage.trim().is_empty() {
+            return Err(AppError::Message(format!(
+                "工具市场配置 {} 缺少 homepage",
+                tool.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn load_settings(app: &AppState) -> Result<Settings, AppError> {
     let path = app.path(SETTINGS_PATH);
     if !path.exists() {
         return Ok(Settings::default());
@@ -1450,6 +1501,32 @@ fn load_settings(app: &AppState) -> Result<Settings, AppError> {
     let mut settings: Settings = serde_json::from_str(&fs::read_to_string(path)?)?;
     settings.workspace_path = sanitize_relative_path(&settings.workspace_path, "workspace");
     Ok(settings)
+}
+
+pub fn save_settings(
+    app: &AppState,
+    network_mode: &str,
+    workspace_path: &str,
+    auto_open_workspace: bool,
+) -> Result<(), AppError> {
+    let manifest = load_manifest(app)?;
+    let settings_path = sanitize_workspace_path(app, workspace_path, "workspace");
+    if !manifest.network_modes.contains_key(network_mode) {
+        return Err(AppError::Message(format!("未知网络模式：{}", network_mode)));
+    }
+    let settings = Settings {
+        network_mode: network_mode.to_string(),
+        workspace_path: settings_path.clone(),
+        auto_open_workspace,
+    };
+    let path = app.path(SETTINGS_PATH);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir_all(app.path(&settings_path))?;
+    let serialized = serde_json::to_string_pretty(&settings)?;
+    fs::write(&path, serialized)?;
+    Ok(())
 }
 
 fn sanitize_relative_path(value: &str, fallback: &str) -> String {
@@ -1464,8 +1541,28 @@ fn sanitize_relative_path(value: &str, fallback: &str) -> String {
     trimmed.replace('\\', "/")
 }
 
+fn sanitize_workspace_path(app: &AppState, value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return fallback.to_string();
+    }
+
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() {
+        if let Ok(relative) = candidate.strip_prefix(&app.root) {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            return sanitize_relative_path(&relative, fallback);
+        }
+        return fallback.to_string();
+    }
+
+    sanitize_relative_path(trimmed, fallback)
+}
+
 fn load_state(app: &AppState) -> Result<ToolStateFile, AppError> {
-    let _guard = STATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = app.path(STATE_PATH);
     if !path.exists() {
         return Ok(ToolStateFile::default());
@@ -1486,7 +1583,9 @@ fn load_state(app: &AppState) -> Result<ToolStateFile, AppError> {
 }
 
 fn save_state(app: &AppState, state: &ToolStateFile) -> Result<(), AppError> {
-    let _guard = STATE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let state_dir = app.path("state");
     fs::create_dir_all(&state_dir)?;
     let final_path = app.path(STATE_PATH);
@@ -1574,11 +1673,7 @@ fn find_existing_path<T: AsRef<str>>(base: &Path, relatives: &[T]) -> Option<Pat
                 // accidentally resolving outside the portable tree (e.g.
                 // Windows compatibility junctions like "Application Data" →
                 // "AppData/Roaming").
-                if child
-                    .file_type()
-                    .map(|t| t.is_symlink())
-                    .unwrap_or(false)
-                {
+                if child.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
                     continue;
                 }
                 let nested = child.path().join(relative.as_ref().replace('/', "\\"));
@@ -1641,7 +1736,10 @@ fn apply_portable_env(app: &AppState, command: &mut Command) {
         .env("USERPROFILE", &home)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
-        .env("XDG_CONFIG_HOME", display_path(&app.path("state/xdg/config")))
+        .env(
+            "XDG_CONFIG_HOME",
+            display_path(&app.path("state/xdg/config")),
+        )
         .env("XDG_CACHE_HOME", display_path(&app.path("state/xdg/cache")))
         .env("XDG_STATE_HOME", display_path(&app.path("state/xdg/state")))
         .env("XDG_DATA_HOME", display_path(&app.path("state/xdg/data")))
@@ -1745,7 +1843,9 @@ fn strip_terminal_escapes(input: &str) -> String {
 fn quote_cmd_arg(input: &str) -> String {
     // cmd.exe metacharacters that need protection when an argument is
     // splatted into a .bat file.
-    const CMD_META: &[char] = &[' ', '\t', '"', '&', '|', '<', '>', '^', '(', ')', '%', '!', ';', ',', '`'];
+    const CMD_META: &[char] = &[
+        ' ', '\t', '"', '&', '|', '<', '>', '^', '(', ')', '%', '!', ';', ',', '`',
+    ];
     if input.is_empty() {
         return "\"\"".to_string();
     }
@@ -1790,7 +1890,8 @@ fn flatten_single_root(destination: &Path) -> Result<(), AppError> {
         let file_name = child.file_name();
         // Reject path-component names that escape the destination.
         let name_str = file_name.to_string_lossy();
-        if name_str == ".." || name_str == "." || name_str.contains('/') || name_str.contains('\\') {
+        if name_str == ".." || name_str == "." || name_str.contains('/') || name_str.contains('\\')
+        {
             return Err(AppError::Message(format!(
                 "归档包含非法路径条目：{}",
                 name_str
@@ -1837,6 +1938,48 @@ fn push_path_check(
     });
 }
 
+fn package_integrity_checks(app: &AppState) -> Vec<HealthCheck> {
+    let mut checks = Vec::new();
+    for (id, label, relative, required) in [
+        ("launcher-start", "一键启动脚本", "Start.cmd", true),
+        ("readme-en", "英文说明文档", "README.md", true),
+        ("readme-zh", "中文说明文档", "README.zh-CN.md", true),
+        ("screenshot", "展示截图", "docs/screenshot.png", false),
+        ("config-manifest", "工具清单文件", MANIFEST_PATH, true),
+        (
+            "config-marketplace",
+            "工具市场文件",
+            MARKETPLACE_PATH,
+            false,
+        ),
+    ] {
+        push_path_check(&mut checks, id, label, &app.path(relative), required);
+    }
+
+    let root_exe = app.path("Portable-AI-Dev-Kit.exe");
+    let release_exe = app.path("src-tauri/target/release/portable-ai-dev-kit.exe");
+    let root_exists = root_exe.exists();
+    let release_exists = release_exe.exists();
+    checks.push(HealthCheck {
+        id: "portable-exe".to_string(),
+        label: "便携可执行文件".to_string(),
+        status: if root_exists || release_exists {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warning
+        },
+        message: if root_exists {
+            display_path(&root_exe)
+        } else if release_exists {
+            display_path(&release_exe)
+        } else {
+            "缺失：根目录 Portable-AI-Dev-Kit.exe 或 release exe 至少需要一个".to_string()
+        },
+    });
+
+    checks
+}
+
 fn summarize_checks(checks: &[HealthCheck]) -> HealthSummary {
     if checks
         .iter()
@@ -1851,6 +1994,64 @@ fn summarize_checks(checks: &[HealthCheck]) -> HealthSummary {
     } else {
         HealthSummary::Healthy
     }
+}
+
+fn render_diagnostics_report(dashboard: &Dashboard, marketplace: &MarketplaceFile) -> String {
+    let mut report = String::new();
+    report.push_str("# Portable AI Dev Kit Diagnostics\n\n");
+    report.push_str("## Environment\n\n");
+    report.push_str(&format!("- Root: `{}`\n", dashboard.root));
+    report.push_str(&format!("- Workspace: `{}`\n", dashboard.workspace));
+    report.push_str(&format!(
+        "- Workspace Path: `{}`\n",
+        dashboard.workspace_path
+    ));
+    report.push_str(&format!("- Network Mode: `{}`\n", dashboard.network_mode));
+    report.push_str(&format!(
+        "- Auto Open Workspace: `{}`\n\n",
+        dashboard.auto_open_workspace
+    ));
+
+    report.push_str("## Health\n\n");
+    report.push_str(&format!("- Summary: `{:?}`\n\n", dashboard.health.summary));
+    for check in &dashboard.health.checks {
+        report.push_str(&format!(
+            "- `{}` / {}: `{:?}` - {}\n",
+            check.id, check.label, check.status, check.message
+        ));
+    }
+
+    report.push_str("\n## Tools\n\n");
+    for tool in &dashboard.tools {
+        report.push_str(&format!(
+            "- `{}` / {}: `{:?}`; installed=`{}`; wanted=`{}`; host=`{}`; base=`{}`; launch=`{}`\n",
+            tool.id,
+            tool.name,
+            tool.status,
+            tool.installed_version.as_deref().unwrap_or("not detected"),
+            tool.wanted_version.as_deref().unwrap_or("not set"),
+            tool.host_version.as_deref().unwrap_or("not detected"),
+            tool.base_path,
+            tool.launch_path.as_deref().unwrap_or("not found"),
+        ));
+        if let Some(error) = &tool.last_error {
+            report.push_str(&format!("  - Last Error: {}\n", error));
+        }
+    }
+
+    report.push_str("\n## Marketplace\n\n");
+    report.push_str(&format!(
+        "- Configured Tools: `{}`\n",
+        marketplace.tools.len()
+    ));
+    for tool in &marketplace.tools {
+        report.push_str(&format!(
+            "- `{}` / {}: package=`{}`, category=`{}`, homepage=`{}`\n",
+            tool.id, tool.name, tool.package_name, tool.category, tool.homepage
+        ));
+    }
+
+    report
 }
 
 fn status_label(status: &ToolStatus) -> &'static str {
@@ -1876,7 +2077,9 @@ pub fn add_custom_tool(
         return Err(AppError::Message("工具名称不能为空".to_string()));
     }
     if trimmed_name.chars().count() > 64 {
-        return Err(AppError::Message("工具名称过长（最多 64 字符）".to_string()));
+        return Err(AppError::Message(
+            "工具名称过长（最多 64 字符）".to_string(),
+        ));
     }
     let mut id_name: String = trimmed_name
         .to_lowercase()
@@ -1900,7 +2103,10 @@ pub fn add_custom_tool(
         if id_name.is_empty() {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&trimmed_name, &mut hasher);
-            id_name = format!("tool-{:x}", std::hash::Hasher::finish(&hasher) & 0xffff_ffff);
+            id_name = format!(
+                "tool-{:x}",
+                std::hash::Hasher::finish(&hasher) & 0xffff_ffff
+            );
         }
     }
     let tool_id = format!("custom-{}", id_name);
@@ -1945,8 +2151,8 @@ pub fn add_custom_tool(
             return Err(AppError::Message("脚本 URL 不能为空".to_string()));
         }
         let url_lower = script_url_val.to_lowercase();
-        let is_local_http = url_lower.starts_with("http://localhost")
-            || url_lower.starts_with("http://127.0.0.1");
+        let is_local_http =
+            url_lower.starts_with("http://localhost") || url_lower.starts_with("http://127.0.0.1");
         if !(url_lower.starts_with("https://") || is_local_http) {
             return Err(AppError::Message(
                 "脚本 URL 必须使用 HTTPS（仅 localhost / 127.0.0.1 允许 HTTP）".to_string(),
@@ -2116,10 +2322,20 @@ mod tests {
             r#"{"networkMode":"global","workspacePath":"workspace","autoOpenWorkspace":false}"#,
         )
         .unwrap();
+        seed_package_files(temp.path());
         let app = AppState {
             root: temp.path().to_path_buf(),
         };
         (temp, app)
+    }
+
+    fn seed_package_files(root: &Path) {
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("Start.cmd"), "@echo off").unwrap();
+        fs::write(root.join("README.md"), "readme").unwrap();
+        fs::write(root.join("README.zh-CN.md"), "readme").unwrap();
+        fs::write(root.join("docs").join("screenshot.png"), "").unwrap();
+        fs::write(root.join("Portable-AI-Dev-Kit.exe"), "").unwrap();
     }
 
     #[test]
@@ -2157,6 +2373,188 @@ mod tests {
     }
 
     #[test]
+    fn save_settings_sanitizes_workspace_path_and_creates_directory() {
+        let (_temp, app) = fixture();
+        save_settings(&app, "global", r"..\evil\workspace", true).unwrap();
+
+        let saved: Settings =
+            serde_json::from_str(&fs::read_to_string(app.path(SETTINGS_PATH)).unwrap()).unwrap();
+        assert_eq!(saved.network_mode, "global");
+        assert_eq!(saved.workspace_path, "workspace");
+        assert!(app.path("workspace").exists());
+    }
+
+    #[test]
+    fn save_settings_accepts_absolute_workspace_inside_root() {
+        let (_temp, app) = fixture();
+        let workspace = app.path("workspace").join("nested");
+        save_settings(&app, "global", &display_path(&workspace), false).unwrap();
+
+        let saved: Settings =
+            serde_json::from_str(&fs::read_to_string(app.path(SETTINGS_PATH)).unwrap()).unwrap();
+        assert_eq!(saved.workspace_path, "workspace/nested");
+        assert!(app.path("workspace/nested").exists());
+    }
+
+    #[test]
+    fn save_settings_rejects_absolute_workspace_outside_root() {
+        let (_temp, app) = fixture();
+        save_settings(&app, "global", r"C:\outside\workspace", false).unwrap();
+
+        let saved: Settings =
+            serde_json::from_str(&fs::read_to_string(app.path(SETTINGS_PATH)).unwrap()).unwrap();
+        assert_eq!(saved.workspace_path, "workspace");
+    }
+
+    #[test]
+    fn save_settings_rejects_unknown_network_mode() {
+        let (_temp, app) = fixture();
+        let error = save_settings(&app, "unknown", "workspace", false).unwrap_err();
+        assert!(error.to_string().contains("未知网络模式"));
+    }
+
+    #[test]
+    fn marketplace_tools_are_loaded_from_config() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MARKETPLACE_PATH),
+            r#"{
+              "tools": [
+                {
+                  "id": "node",
+                  "name": "Node.js",
+                  "description": "Portable Node runtime",
+                  "packageName": "node",
+                  "category": "Runtime",
+                  "homepage": "https://nodejs.org"
+                },
+                {
+                  "id": "freebuff",
+                  "name": "freebuff",
+                  "description": "AI CLI",
+                  "packageName": "freebuff",
+                  "category": "AI CLI",
+                  "homepage": "https://example.invalid"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let tools = get_marketplace_tools(&app).unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools
+            .iter()
+            .any(|tool| tool.id == "node" && tool.in_manifest));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.id == "freebuff" && !tool.in_manifest));
+    }
+
+    #[test]
+    fn health_reports_marketplace_config_check() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MARKETPLACE_PATH),
+            r#"{"tools":[{"id":"freebuff","name":"freebuff","description":"AI CLI","packageName":"freebuff","category":"AI CLI","homepage":"https://example.invalid"}]}"#,
+        )
+        .unwrap();
+
+        let health = check_health(&app).unwrap();
+        assert!(health
+            .checks
+            .iter()
+            .any(|check| check.id == "marketplace-config"));
+    }
+
+    #[test]
+    fn dashboard_tolerates_invalid_marketplace_config() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MARKETPLACE_PATH),
+            r#"{"tools":[{"id":"","name":"","description":"broken","packageName":"","category":"AI CLI","homepage":""}]}"#,
+        )
+        .unwrap();
+
+        let dashboard = get_dashboard(&app, false).unwrap();
+        let check = dashboard
+            .health
+            .checks
+            .iter()
+            .find(|check| check.id == "marketplace-config")
+            .expect("marketplace check missing");
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.message.contains("工具市场配置"));
+    }
+
+    #[test]
+    fn health_reports_package_integrity_checks() {
+        let (_temp, app) = fixture();
+        fs::remove_file(app.path("Start.cmd")).unwrap();
+        fs::remove_file(app.path("Portable-AI-Dev-Kit.exe")).unwrap();
+        let dashboard = get_dashboard(&app, false).unwrap();
+
+        let start_check = dashboard
+            .health
+            .checks
+            .iter()
+            .find(|check| check.id == "launcher-start")
+            .expect("launcher check missing");
+        assert_eq!(start_check.status, CheckStatus::Error);
+
+        let exe_check = dashboard
+            .health
+            .checks
+            .iter()
+            .find(|check| check.id == "portable-exe")
+            .expect("exe check missing");
+        assert_eq!(exe_check.status, CheckStatus::Warning);
+    }
+
+    #[test]
+    fn package_integrity_passes_when_required_files_exist() {
+        let (_temp, app) = fixture();
+        fs::write(app.path("Start.cmd"), "@echo off").unwrap();
+        fs::write(app.path("README.md"), "readme").unwrap();
+        fs::write(app.path("README.zh-CN.md"), "readme").unwrap();
+        fs::write(app.path("Portable-AI-Dev-Kit.exe"), "").unwrap();
+
+        let health = check_health(&app).unwrap();
+        for id in ["launcher-start", "readme-en", "readme-zh", "portable-exe"] {
+            let check = health
+                .checks
+                .iter()
+                .find(|check| check.id == id)
+                .expect("package check missing");
+            assert_eq!(check.status, CheckStatus::Ok);
+        }
+    }
+
+    #[test]
+    fn export_diagnostics_writes_markdown_report() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MARKETPLACE_PATH),
+            r#"{"tools":[{"id":"freebuff","name":"freebuff","description":"AI CLI","packageName":"freebuff","category":"AI CLI","homepage":"https://example.invalid"}]}"#,
+        )
+        .unwrap();
+
+        let report = export_diagnostics(&app).unwrap();
+        let content = fs::read_to_string(report.path).unwrap();
+        assert!(content.contains("# Portable AI Dev Kit Diagnostics"));
+        assert!(content.contains("## Health"));
+        assert!(content.contains("## Tools"));
+        assert!(content.contains("freebuff"));
+    }
+
+    #[test]
+    fn missing_marketplace_config_returns_empty_list() {
+        let (_temp, app) = fixture();
+        let tools = get_marketplace_tools(&app).unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[test]
     fn discover_returns_manifest_root_not_nested_candidate() {
         let (temp, _app) = fixture();
         let nested = temp.path().join("src-tauri").join("target").join("release");
@@ -2169,7 +2567,8 @@ mod tests {
     fn strip_terminal_escapes_removes_ansi_and_cr() {
         // SGR color codes, an OSC title sequence, a stray ESC X, and a \r
         // progress redraw — all should vanish, leaving Chinese chars intact.
-        let raw = "\u{1b}[32m installed\u{1b}[0m\r\nadded 5 packages\r\u{1b}]0;title\u{07}\u{1b}M中文";
+        let raw =
+            "\u{1b}[32m installed\u{1b}[0m\r\nadded 5 packages\r\u{1b}]0;title\u{07}\u{1b}M中文";
         let cleaned = strip_terminal_escapes(raw);
         assert_eq!(cleaned, " installed\nadded 5 packages中文");
     }

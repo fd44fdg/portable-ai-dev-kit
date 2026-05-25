@@ -315,6 +315,172 @@ button:disabled {
   opacity: 0.42;
 }
 
+/* ── Settings Modal ─────────────────────────────── */
+
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.radio-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(2, 15, 14, 0.3);
+  border: 1px solid rgba(219, 249, 242, 0.12);
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.radio-option:hover {
+  border-color: rgba(103, 214, 160, 0.3);
+  background: rgba(4, 18, 18, 0.4);
+}
+
+.radio-option input[type="radio"] {
+  margin-top: 3px;
+  accent-color: #67d6a0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.radio-option div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.radio-option strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: #edf7f6;
+}
+
+.radio-option small {
+  font-size: 11px;
+  color: rgba(225, 242, 239, 0.5);
+  line-height: 1.4;
+}
+
+.input-with-button {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.input-with-button input {
+  flex: 1;
+}
+
+.browse-btn {
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: rgba(239, 252, 249, 0.12);
+  color: #edf7f6;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid rgba(219, 249, 242, 0.2);
+  transition: background 0.2s;
+  white-space: nowrap;
+}
+
+.browse-btn:hover {
+  background: rgba(239, 252, 249, 0.2);
+}
+
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  color: rgba(225, 242, 239, 0.72);
+}
+
+.toggle-label input[type="checkbox"] {
+  accent-color: #67d6a0;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.toggle-label span {
+  line-height: 1.5;
+}
+
+.language-selector {
+  display: flex;
+  gap: 8px;
+}
+
+.lang-btn {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(219, 249, 242, 0.2);
+  background: rgba(2, 15, 14, 0.35);
+  color: rgba(225, 242, 239, 0.6);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.lang-btn:hover {
+  color: #edf7f6;
+  background: rgba(4, 18, 18, 0.5);
+  border-color: rgba(103, 214, 160, 0.3);
+}
+
+.lang-btn.active {
+  background: rgba(103, 214, 160, 0.15);
+  color: #67d6a0;
+  border-color: rgba(103, 214, 160, 0.4);
+}
+
+.sidebar-bottom {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.settings-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(225, 242, 239, 0.6);
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid rgba(219, 249, 242, 0.15);
+  transition: all 0.2s;
+  text-align: left;
+}
+
+.settings-btn:hover {
+  color: #edf7f6;
+  background: rgba(239, 252, 249, 0.08);
+  border-color: rgba(219, 249, 242, 0.3);
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.topbar-actions .icon-button {
+  width: 42px;
+  height: 40px;
+}
+
 .health-icon.ok {
   color: #77e0ab;
 }
