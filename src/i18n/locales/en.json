@@ -1,6 +1,7 @@
 {
   "loadingApp": "Loading portable environment console...",
   "loadFailed": "Failed to load portable environment",
+  "startupTimeout": "Portable environment startup did not finish within 120 seconds. Export diagnostics or restart the app; if it persists, check Node/npm integrity first.",
   "retry": "Retry",
   "retryLoading": "Retrying to load portable environment...",
   "envLoaded": "Loaded portable environment: {{root}}",
@@ -99,5 +100,7 @@
   "closeToast": "Close notification",
   "unknownError": "Unknown error",
   "toolNotFound": "Unknown tool",
+  "emptyToolList": "Tool list is empty. Check config/tool-manifest.json",
+  "noActiveTool": "Active tool is missing or invalid",
   "createdBy": "Created By Deerflow"
 }

@@ -126,6 +126,14 @@ function nowStamp(): string {
 
 const FOCUSABLE_SELECTOR =
   'a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex=-1])';
+const BOOTSTRAP_TIMEOUT_MS = 120000;
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(resolve, reject).finally(() => window.clearTimeout(timeout));
+  });
+}
 
 function useFocusTrap(open: boolean) {
   const ref = useRef<HTMLDivElement>(null);
@@ -268,7 +276,11 @@ function App() {
 
   const load = useCallback(async (keepLog = false, force = false) => {
     setStartupError(null);
-    const next = await invoke<Dashboard>('bootstrap', { force });
+    const next = await withTimeout(
+      invoke<Dashboard>('bootstrap', { force }),
+      BOOTSTRAP_TIMEOUT_MS,
+      t('startupTimeout'),
+    );
     setDashboard(next);
     setActiveTool((current) => next.tools.some((tool) => tool.id === current) ? current : next.tools[0]?.id ?? '');
     if (!keepLog) {
@@ -358,7 +370,7 @@ function App() {
       if (!isMountedRef.current) return;
       const combined = [result.message, result.output].filter(Boolean).join('\n');
       if (combined) setLog(combined);
-      await load(true);
+      await load(true, true);
     } catch (error) {
       if (isMountedRef.current) { const message = extractErrorMessage(error, t); setLog(message); pushToast(message, 'error'); }
     } finally {
@@ -572,7 +584,7 @@ function App() {
 
 
 
-  if (!dashboard || !active) {
+  if (!dashboard) {
     return (
       <main className='shell loading-shell'>
         <div className='aurora' />
@@ -600,6 +612,38 @@ function App() {
                 <RefreshCw size={17} /> {t('retry')}
               </button>
             )}
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  if (!active) {
+    return (
+      <main className='shell loading-shell'>
+        <div className='aurora' />
+        <section className='glass-panel loading-panel'>
+          <AlertTriangle size={28} />
+          <div>
+            <p>{t('loadFailed')}</p>
+            <small>{dashboard.tools.length === 0 ? t('emptyToolList') : t('noActiveTool')}</small>
+            <button
+              type='button'
+              className='primary'
+              style={{ marginTop: 12 }}
+              onClick={() => {
+                setStartupError(null);
+                setLog(t('retryLoading'));
+                load(false).catch((error) => {
+                  if (!isMountedRef.current) return;
+                  const message = extractErrorMessage(error, t);
+                  setStartupError(message);
+                  setLog(message);
+                });
+              }}
+            >
+              <RefreshCw size={17} /> {t('retry')}
+            </button>
           </div>
         </section>
       </main>

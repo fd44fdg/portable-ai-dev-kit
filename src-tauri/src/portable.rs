@@ -709,10 +709,16 @@ fn install_tool(
     let mut state = load_state(app)?;
     for dependency in &tool.install.depends_on {
         let dep = find_tool(manifest, dependency)?;
-        if tool_view(app, dep, &mut state, false)?.status != ToolStatus::Ready {
+        let dep_view = tool_view(app, dep, &mut state, false)?;
+        if dep_view.status != ToolStatus::Ready {
+            let detail = dep_view
+                .last_error
+                .filter(|error| !error.trim().is_empty())
+                .map(|error| format!("\n{}", error))
+                .unwrap_or_default();
             return Err(AppError::Message(format!(
-                "{} 依赖 {}，请先安装依赖项。",
-                tool.name, dep.name
+                "{} 依赖 {}，请先安装依赖项。{}",
+                tool.name, dep.name, detail
             )));
         }
     }
@@ -731,8 +737,7 @@ fn install_npm_tool(
     tool: &ToolDefinition,
 ) -> Result<ToolCommandResult, AppError> {
     let node_root = app.path("apps/node");
-    let npm = find_existing_path(&node_root, &["npm.cmd", "node_modules/npm/bin/npm-cli.js"])
-        .ok_or_else(|| AppError::Message("Node/npm 尚未安装".to_string()))?;
+    validate_portable_npm(app).map_err(AppError::Message)?;
     let package_name = tool
         .package_name
         .as_ref()
@@ -748,22 +753,7 @@ fn install_npm_tool(
         )?;
     }
 
-    let mut command = if npm
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("js"))
-        .unwrap_or(false)
-    {
-        // npm-cli.js is a JS file — Windows can't execute it directly.
-        // Use the bundled node.exe to run it instead.
-        let node_exe = find_existing_path(&node_root, &["node.exe"])
-            .ok_or_else(|| AppError::Message("Node 可执行文件未找到".to_string()))?;
-        let mut cmd = Command::new(node_exe);
-        cmd.arg(&npm);
-        cmd
-    } else {
-        Command::new(&npm)
-    };
+    let mut command = portable_npm_command(app)?;
     command
         .arg("install")
         .arg("--prefix")
@@ -809,6 +799,50 @@ fn install_npm_tool(
     })
 }
 
+fn portable_npm_command(app: &AppState) -> Result<Command, AppError> {
+    let node_root = app.path("apps/node");
+    let npm = find_existing_path(&node_root, &["npm.cmd", "node_modules/npm/bin/npm-cli.js"])
+        .ok_or_else(|| AppError::Message("Node/npm 尚未安装".to_string()))?;
+    if npm
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("js"))
+        .unwrap_or(false)
+    {
+        // npm-cli.js is a JS file; run it through the bundled node.exe.
+        let node_exe = find_existing_path(&node_root, &["node.exe"])
+            .ok_or_else(|| AppError::Message("Node 可执行文件未找到".to_string()))?;
+        let mut command = Command::new(node_exe);
+        command.arg(&npm);
+        Ok(command)
+    } else {
+        Ok(Command::new(&npm))
+    }
+}
+
+fn validate_portable_npm(app: &AppState) -> Result<String, String> {
+    let node_root = app.path("apps/node");
+    let mut command = portable_npm_command(app).map_err(|error| error.to_string())?;
+    command
+        .arg("--version")
+        .current_dir(display_path(&node_root));
+    apply_portable_env(app, &mut command);
+    prepend_path(&mut command, &node_root);
+
+    let output = run_command_with_timeout(command, std::time::Duration::from_secs(5))
+        .ok_or_else(|| "便携 Node/npm 校验超时，请重装 Node.js。".to_string())?;
+    if output.status.success() {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok(version);
+    }
+
+    let combined = command_output(&output);
+    Err(format!(
+        "便携 Node/npm 不完整或无法运行。请先在界面中卸载并重新安装 Node.js，然后再安装 AI CLI。\n{}",
+        combined
+    ))
+}
+
 fn patch_freebuff_index(app: &AppState, tool: &ToolDefinition) -> Result<Option<String>, AppError> {
     let index_path = app
         .path(&tool.base_path)
@@ -817,24 +851,22 @@ fn patch_freebuff_index(app: &AppState, tool: &ToolDefinition) -> Result<Option<
         return Ok(None);
     }
 
-    let raw = fs::read_to_string(&index_path)?;
-    if raw.contains("Portable AI Dev Kit stream patch") {
-        return Ok(Some(format!(
-            "freebuff stream pipeline patch already present: {}",
-            display_path(&index_path)
-        )));
-    }
+    let mut raw = fs::read_to_string(&index_path)?;
+    let mut notes = Vec::new();
 
-    let start = raw
-        .find("  res.on('data', (chunk) => {")
-        .ok_or_else(|| AppError::Message("无法定位 freebuff 下载进度代码".to_string()))?;
-    let end_marker =
-        "\n\n  const tempBinaryPath = path.join(CONFIG.tempDownloadDir, CONFIG.binaryName)";
-    let end = raw[start..]
-        .find(end_marker)
-        .map(|offset| start + offset)
-        .ok_or_else(|| AppError::Message("无法定位 freebuff 解压后续代码".to_string()))?;
-    let replacement = r#"  const ProgressTransform = require('stream').Transform
+    if raw.contains("Portable AI Dev Kit stream patch") {
+        notes.push("freebuff stream pipeline patch already present".to_string());
+    } else {
+        let start = raw
+            .find("  res.on('data', (chunk) => {")
+            .ok_or_else(|| AppError::Message("无法定位 freebuff 下载进度代码".to_string()))?;
+        let end_marker =
+            "\n\n  const tempBinaryPath = path.join(CONFIG.tempDownloadDir, CONFIG.binaryName)";
+        let end = raw[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .ok_or_else(|| AppError::Message("无法定位 freebuff 解压后续代码".to_string()))?;
+        let replacement = r#"  const ProgressTransform = require('stream').Transform
   const progress = new ProgressTransform({
     transform(chunk, _encoding, callback) {
       downloadedSize += chunk.length
@@ -875,15 +907,85 @@ fn patch_freebuff_index(app: &AppState, tool: &ToolDefinition) -> Result<Option<
     res.pipe(progress).pipe(gunzip).pipe(extract)
   })"#;
 
-    let mut patched = String::with_capacity(raw.len() + replacement.len());
-    patched.push_str(&raw[..start]);
-    patched.push_str(replacement);
-    patched.push_str(&raw[end..]);
-    fs::write(&index_path, patched)?;
+        let mut patched = String::with_capacity(raw.len() + replacement.len());
+        patched.push_str(&raw[..start]);
+        patched.push_str(replacement);
+        patched.push_str(&raw[end..]);
+        raw = patched;
+        notes.push("freebuff stream pipeline patched".to_string());
+    }
+
+    if raw.contains("Portable AI Dev Kit update restart patch") {
+        notes.push("freebuff update restart patch already present".to_string());
+    } else {
+        let function_marker = "async function checkForUpdates(runningProcess, exitListener) {\n";
+        let insert_at = raw
+            .find(function_marker)
+            .map(|offset| offset + function_marker.len())
+            .ok_or_else(|| AppError::Message("无法定位 freebuff 更新检查函数".to_string()))?;
+        raw.insert_str(insert_at, "  let portableUpdateKilledProcess = false\n");
+
+        let kill_marker = "            runningProcess.kill('SIGKILL')\n";
+        let kill_at = raw
+            .find(kill_marker)
+            .ok_or_else(|| AppError::Message("无法定位 freebuff 强制停止代码".to_string()))?;
+        raw.insert_str(
+            kill_at + kill_marker.len(),
+            "            portableUpdateKilledProcess = true\n",
+        );
+
+        let term_marker = "        runningProcess.kill('SIGTERM')\n";
+        let term_at = raw
+            .find(term_marker)
+            .ok_or_else(|| AppError::Message("无法定位 freebuff 停止代码".to_string()))?;
+        raw.insert_str(
+            term_at + term_marker.len(),
+            "          portableUpdateKilledProcess = true\n",
+        );
+
+        let catch_marker = "  } catch (error) {\n    // Ignore update failures\n  }\n}";
+        let catch_replacement = r#"  } catch (error) {
+    // Portable AI Dev Kit update restart patch: freebuff kills the running
+    // binary before replacing it. If the download/extract step fails, restart
+    // the old binary instead of dropping the user back to an empty prompt.
+    const message = error && error.message ? error.message : String(error)
+    console.error(`freebuff update failed: ${message}`)
+    if (portableUpdateKilledProcess) {
+        const fallbackChild = spawn(CONFIG.binaryPath, process.argv.slice(2), {
+        stdio: 'inherit',
+        detached: false,
+      })
+
+      fallbackChild.on('exit', (code, signal) => {
+        resetTerminal()
+        printCrashDiagnostics(code, signal)
+        process.exit(signal ? 1 : (code || 0))
+      })
+
+      fallbackChild.on('error', (err) => {
+        console.error('Failed to restart freebuff:', err.message)
+        process.exit(1)
+      })
+
+      return new Promise(() => {})
+    }
+  }
+}"#;
+        if !raw.contains(catch_marker) {
+            return Err(AppError::Message(
+                "无法替换 freebuff 更新失败处理代码".to_string(),
+            ));
+        }
+        raw = raw.replacen(catch_marker, catch_replacement, 1);
+        notes.push("freebuff update restart patched".to_string());
+    }
+
+    fs::write(&index_path, raw)?;
 
     Ok(Some(format!(
-        "freebuff stream pipeline patched: {}",
-        display_path(&index_path)
+        "{}: {}",
+        notes.join("; "),
+        display_path(&index_path),
     )))
 }
 
@@ -1090,7 +1192,7 @@ fn tool_view(
 ) -> Result<ToolView, AppError> {
     let base = app.path(&tool.base_path);
     let launch = find_existing_path(&base, &tool.bin_paths);
-    let status = if launch.is_some() {
+    let mut status = if launch.is_some() {
         ToolStatus::Ready
     } else if base.exists() {
         ToolStatus::Partial
@@ -1098,8 +1200,17 @@ fn tool_view(
         ToolStatus::Missing
     };
     let mut persisted = state.tools.get(&tool.id).cloned().unwrap_or_default();
+    if tool.id == "node" && status == ToolStatus::Ready {
+        if let Err(error) = validate_portable_npm(app) {
+            status = ToolStatus::Partial;
+            persisted.last_error = Some(error.chars().take(2000).collect());
+        } else {
+            persisted.last_error = None;
+        }
+    }
+    let self_updating = tool.package_name.as_deref() == Some("freebuff");
     let detected_version = if status == ToolStatus::Ready {
-        if force || persisted.installed_version.is_none() {
+        if force || self_updating || persisted.installed_version.is_none() {
             let detected = detect_version(app, tool);
             persisted.installed_version = detected.clone();
             detected
@@ -1111,12 +1222,19 @@ fn tool_view(
     };
     let host_version = if tool.host_version_command.is_empty() {
         None
-    } else if force || persisted.host_version.is_none() {
+    } else if force {
+        // Only run host detection when explicitly requested (refresh/retry).
+        // This avoids potential hangs from powershell.exe / where.exe on
+        // the initial bootstrap, keeping first-launch fast and reliable.
         let detected = detect_host_version(tool);
         persisted.host_version = detected.clone();
         detected
-    } else {
+    } else if persisted.host_version.is_some() {
         persisted.host_version.clone()
+    } else {
+        // Skip host detection on initial load; cached value will be
+        // populated once the user triggers a refresh.
+        None
     };
     let host_available = host_version.is_some();
     state.tools.insert(tool.id.clone(), persisted.clone());
@@ -1379,8 +1497,7 @@ fn host_executable_path(executable: &str) -> Option<String> {
     if let Some(system_path) = host_system_path() {
         cmd.env("PATH", system_path);
     }
-    cmd.output()
-        .ok()
+    run_command_with_timeout(cmd, std::time::Duration::from_secs(5))
         .and_then(|output| {
             if output.status.success() {
                 String::from_utf8_lossy(&output.stdout)
@@ -1397,7 +1514,8 @@ fn host_executable_path(executable: &str) -> Option<String> {
 fn host_system_path() -> Option<String> {
     // PowerShell to read the Machine + User PATH (i.e. the host's PATH as seen
     // by a freshly spawned cmd window), so portable PATH prepends do not leak.
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
@@ -1405,9 +1523,8 @@ fn host_system_path() -> Option<String> {
         .arg(
             "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + \
              [Environment]::GetEnvironmentVariable('Path','User')",
-        )
-        .output()
-        .ok()?;
+        );
+    let output = run_command_with_timeout(command, std::time::Duration::from_secs(5))?;
     if !output.status.success() {
         return None;
     }
@@ -1977,6 +2094,24 @@ fn package_integrity_checks(app: &AppState) -> Vec<HealthCheck> {
         },
     });
 
+    let node_root = app.path("apps/node");
+    if node_root.exists() {
+        match validate_portable_npm(app) {
+            Ok(version) => checks.push(HealthCheck {
+                id: "portable-npm".to_string(),
+                label: "便携 npm".to_string(),
+                status: CheckStatus::Ok,
+                message: format!("npm {}", version),
+            }),
+            Err(error) => checks.push(HealthCheck {
+                id: "portable-npm".to_string(),
+                label: "便携 npm".to_string(),
+                status: CheckStatus::Error,
+                message: error,
+            }),
+        }
+    }
+
     checks
 }
 
@@ -2362,8 +2497,147 @@ mod tests {
         let (_temp, app) = fixture();
         fs::create_dir_all(app.path("apps/node")).unwrap();
         fs::write(app.path("apps/node/node.exe"), "").unwrap();
+        fs::write(
+            app.path("apps/node/npm.cmd"),
+            "@echo off\r\necho 10.0.0\r\n",
+        )
+        .unwrap();
         let dashboard = get_dashboard(&app, false).unwrap();
         assert_eq!(dashboard.tools[0].status, ToolStatus::Ready);
+    }
+
+    #[test]
+    fn dashboard_reports_partial_node_when_npm_is_broken() {
+        let (_temp, app) = fixture();
+        fs::create_dir_all(app.path("apps/node")).unwrap();
+        fs::write(app.path("apps/node/node.exe"), "").unwrap();
+
+        let dashboard = get_dashboard(&app, false).unwrap();
+        assert_eq!(dashboard.tools[0].status, ToolStatus::Partial);
+        assert!(dashboard.tools[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Node/npm"));
+
+        let npm_check = dashboard
+            .health
+            .checks
+            .iter()
+            .find(|check| check.id == "portable-npm")
+            .expect("portable npm check missing");
+        assert_eq!(npm_check.status, CheckStatus::Error);
+    }
+
+    #[test]
+    fn freebuff_patch_adds_update_restart_when_stream_patch_exists() {
+        let (_temp, app) = fixture();
+        let tool = ToolDefinition {
+            id: "custom-freebuff".to_string(),
+            name: "freebuff".to_string(),
+            kind: ToolKind::AiCli,
+            required: false,
+            base_path: "tools/custom/custom-freebuff".to_string(),
+            package_name: Some("freebuff".to_string()),
+            version_command: vec![],
+            host_version_command: vec![],
+            bin_paths: vec![],
+            run_command: vec![],
+            login_command: vec![],
+            install: InstallDefinition {
+                install_type: InstallType::Npm,
+                depends_on: vec!["node".to_string()],
+                archive_name: None,
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: None,
+            },
+        };
+        let index_path = app
+            .path(&tool.base_path)
+            .join("node_modules/freebuff/index.js");
+        fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        fs::write(
+            &index_path,
+            r#"const { spawn } = require('child_process')
+// Portable AI Dev Kit stream patch
+async function checkForUpdates(runningProcess, exitListener) {
+  try {
+      await new Promise((resolve) => {
+        runningProcess.kill('SIGTERM')
+        setTimeout(() => {
+          if (!exited) {
+            runningProcess.kill('SIGKILL')
+            setTimeout(() => resolve(), 1000)
+          }
+        }, 5000)
+      })
+  } catch (error) {
+    // Ignore update failures
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let note = patch_freebuff_index(&app, &tool).unwrap().unwrap();
+        let patched = fs::read_to_string(index_path).unwrap();
+        assert!(note.contains("update restart patched"));
+        assert!(patched.contains("Portable AI Dev Kit stream patch"));
+        assert!(patched.contains("Portable AI Dev Kit update restart patch"));
+        assert!(patched.contains("portableUpdateKilledProcess = true"));
+    }
+
+    #[test]
+    fn freebuff_version_is_refreshed_even_when_state_has_old_version() {
+        let (_temp, app) = fixture();
+        let tool = ToolDefinition {
+            id: "custom-freebuff".to_string(),
+            name: "freebuff".to_string(),
+            kind: ToolKind::AiCli,
+            required: false,
+            base_path: "tools/custom/custom-freebuff".to_string(),
+            package_name: Some("freebuff".to_string()),
+            version_command: vec![
+                "node_modules/.bin/freebuff.cmd".to_string(),
+                "--version".to_string(),
+            ],
+            host_version_command: vec![],
+            bin_paths: vec!["node_modules/.bin/freebuff.cmd".to_string()],
+            run_command: vec![],
+            login_command: vec![],
+            install: InstallDefinition {
+                install_type: InstallType::Npm,
+                depends_on: vec!["node".to_string()],
+                archive_name: None,
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: None,
+            },
+        };
+        let bin_path = app
+            .path(&tool.base_path)
+            .join("node_modules/.bin/freebuff.cmd");
+        fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        fs::write(&bin_path, "@echo off\r\necho 0.0.100\r\n").unwrap();
+        let mut state = ToolStateFile::default();
+        state.tools.insert(
+            tool.id.clone(),
+            PersistedToolState {
+                installed_version: Some("0.0.95".to_string()),
+                ..PersistedToolState::default()
+            },
+        );
+
+        let view = tool_view(&app, &tool, &mut state, false).unwrap();
+        assert_eq!(view.installed_version.as_deref(), Some("0.0.100"));
+        assert_eq!(
+            state
+                .tools
+                .get(&tool.id)
+                .and_then(|tool| tool.installed_version.as_deref()),
+            Some("0.0.100")
+        );
     }
 
     #[test]

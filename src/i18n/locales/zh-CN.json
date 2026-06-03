@@ -1,6 +1,7 @@
 {
   "loadingApp": "正在启动便携环境控制台...",
   "loadFailed": "便携环境加载失败",
+  "startupTimeout": "启动便携环境超过 120 秒仍未完成。请导出诊断报告或重启程序后重试；若仍复现，优先检查 Node/npm 完整性。",
   "retry": "重试",
   "retryLoading": "正在重试加载便携环境...",
   "envLoaded": "已加载便携环境：{{root}}",
@@ -99,5 +100,7 @@
   "closeToast": "关闭通知",
   "unknownError": "未知错误",
   "toolNotFound": "未知工具",
+  "emptyToolList": "工具列表为空，请检查 config/tool-manifest.json 配置文件",
+  "noActiveTool": "活动工具无效或缺失",
   "createdBy": "Created By Deerflow"
 }
