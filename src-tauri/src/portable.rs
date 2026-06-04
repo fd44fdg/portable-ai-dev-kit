@@ -17,6 +17,7 @@ const MANIFEST_PATH: &str = "config/tool-manifest.json";
 const SETTINGS_PATH: &str = "config/app-settings.json";
 const STATE_PATH: &str = "state/tool-state.json";
 const MARKETPLACE_PATH: &str = "config/marketplace.json";
+const DEFAULT_MARKETPLACE_JSON: &str = include_str!("../../config/marketplace.json");
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -1598,7 +1599,9 @@ fn is_qoder_package_alias(package_name: &str) -> bool {
 fn load_marketplace(app: &AppState) -> Result<MarketplaceFile, AppError> {
     let path = app.path(MARKETPLACE_PATH);
     if !path.exists() {
-        return Ok(MarketplaceFile::default());
+        return Ok(serde_json::from_str::<MarketplaceFile>(
+            DEFAULT_MARKETPLACE_JSON,
+        )?);
     }
     let raw = fs::read_to_string(path)?;
     Ok(serde_json::from_str::<MarketplaceFile>(&raw)?)
@@ -2089,14 +2092,25 @@ fn package_integrity_checks(app: &AppState) -> Vec<HealthCheck> {
         ("readme-zh", "中文说明文档", "README.zh-CN.md", true),
         ("screenshot", "展示截图", "docs/screenshot.png", false),
         ("config-manifest", "工具清单文件", MANIFEST_PATH, true),
-        (
-            "config-marketplace",
-            "工具市场文件",
-            MARKETPLACE_PATH,
-            false,
-        ),
     ] {
         push_path_check(&mut checks, id, label, &app.path(relative), required);
+    }
+    let marketplace_path = app.path(MARKETPLACE_PATH);
+    if marketplace_path.exists() {
+        push_path_check(
+            &mut checks,
+            "config-marketplace",
+            "工具市场文件",
+            &marketplace_path,
+            false,
+        );
+    } else {
+        checks.push(HealthCheck {
+            id: "config-marketplace".to_string(),
+            label: "工具市场文件".to_string(),
+            status: CheckStatus::Ok,
+            message: "缺失外部配置，已使用内置工具市场配置".to_string(),
+        });
     }
 
     let root_exe = app.path("Portable-AI-Dev-Kit.exe");
@@ -2918,7 +2932,22 @@ async function checkForUpdates(runningProcess, exitListener) {
     fn missing_marketplace_config_returns_empty_list() {
         let (_temp, app) = fixture();
         let tools = get_marketplace_tools(&app).unwrap();
-        assert!(tools.is_empty());
+        assert!(!tools.is_empty());
+        assert!(tools.iter().any(|tool| tool.id == "qoder"));
+    }
+
+    #[test]
+    fn missing_marketplace_config_uses_embedded_fallback_without_warning() {
+        let (_temp, app) = fixture();
+        let dashboard = get_dashboard(&app, false).unwrap();
+        let check = dashboard
+            .health
+            .checks
+            .iter()
+            .find(|check| check.id == "config-marketplace")
+            .expect("marketplace file check missing");
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("内置工具市场配置"));
     }
 
     #[test]

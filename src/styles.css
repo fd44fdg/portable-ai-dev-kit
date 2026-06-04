@@ -182,9 +182,10 @@ dd,
 .content {
   z-index: 1;
   display: grid;
-  grid-template-rows: 82px minmax(0, 1fr) 190px;
+  grid-template-rows: 82px minmax(0, 1fr) minmax(190px, 24vh);
   gap: 18px;
   min-width: 0;
+  min-height: 0;
 }
 
 .topbar {
@@ -548,6 +549,8 @@ pre::-webkit-scrollbar-thumb:hover {
 }
 
 .log-panel {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
 }
 
@@ -557,8 +560,10 @@ pre::-webkit-scrollbar-thumb:hover {
 }
 
 pre {
-  height: 126px;
+  flex: 1;
+  min-height: 0;
   margin: 0;
+  padding-bottom: 12px;
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-color: rgba(222, 247, 241, 0.38) rgba(222, 247, 241, 0.08);
@@ -1077,4 +1082,3 @@ pre {
     transform: translateY(0) translateX(0);
   }
 }
-

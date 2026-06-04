@@ -10,7 +10,6 @@ import {
   ExternalLink,
   FileText,
   HardDrive,
-  KeyRound,
   Play,
   Plus,
   RefreshCw,
@@ -304,7 +303,7 @@ function App() {
     setRefreshing(true);
     setLog(t('refreshing'));
     try {
-      await load(true, true);
+      await load(true, false);
       setLog(t('refreshDone'));
     } catch (error) {
       const message = extractErrorMessage(error, t);
@@ -338,7 +337,7 @@ function App() {
   );
 
   const runAction = useCallback(async (
-    action: 'install_tool' | 'uninstall_tool' | 'update_tool' | 'launch_tool' | 'login_tool',
+    action: 'install_tool' | 'uninstall_tool' | 'update_tool' | 'launch_tool',
     toolId: string,
   ) => {
     if (runActionInFlightRef.current) return;
@@ -348,7 +347,7 @@ function App() {
     try {
       const tool = dashboard?.tools.find((item) => item.id === toolId);
       let workspaceDir: string | null = null;
-      if ((action === 'launch_tool' || action === 'login_tool') && tool?.kind === 'ai-cli') {
+      if (action === 'launch_tool' && tool?.kind === 'ai-cli') {
         if (dashboard?.autoOpenWorkspace) {
           workspaceDir = dashboard.workspace;
           setLog(t('usingDefaultWorkspace', { workspace: dashboard.workspace }));
@@ -363,7 +362,7 @@ function App() {
         }
       }
       const args =
-        action === 'launch_tool' || action === 'login_tool'
+        action === 'launch_tool'
           ? { toolId, workspaceDir }
           : { toolId };
       const result = await invoke<ToolCommandResult>(action, args);
@@ -802,12 +801,6 @@ function App() {
               >
                 {busyTool === active.id ? <Activity className='spin' size={17} /> : <RefreshCw size={17} />}
                 {busyTool === active.id ? t('actionProcessing') : t('actionUpdate')}
-              </button>
-              <button
-                disabled={busyTool === active.id || active.status === 'missing' || active.kind !== 'ai-cli'}
-                onClick={() => runAction('login_tool', active.id)}
-              >
-                <KeyRound size={17} /> {t('actionLogin')}
               </button>
               <button
                 disabled={busyTool === active.id || active.status === 'missing' || active.kind !== 'ai-cli'}
