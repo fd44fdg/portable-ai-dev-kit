@@ -465,9 +465,11 @@ function App() {
         workspacePath: settingsValues.workspacePath,
         autoOpenWorkspace: settingsValues.autoOpenWorkspace,
       });
+      if (!isMountedRef.current) return;
+      setSettingsSaving(false);
       setShowSettings(false);
-      await load(true, true);
       setLog(t('settingsSaved'));
+      await load(true, false);
     } catch (error) {
       if (isMountedRef.current) { const message = extractErrorMessage(error, t); pushToast(message, 'error'); }
     } finally {
