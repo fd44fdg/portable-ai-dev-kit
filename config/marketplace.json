@@ -47,6 +47,14 @@
       "packageName": "antigravity",
       "category": "AI CLI",
       "homepage": "https://antigravity.google"
+    },
+    {
+      "id": "qoder",
+      "name": "Qoder CLI",
+      "description": "Qoder 官方命令行工具，使用 qodercli 启动",
+      "packageName": "@qoder-ai/qodercli",
+      "category": "AI CLI",
+      "homepage": "https://docs.qoder.com/en/cli/quick-start"
     }
   ]
 }

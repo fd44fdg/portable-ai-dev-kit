@@ -1566,7 +1566,33 @@ fn load_manifest(app: &AppState) -> Result<Manifest, AppError> {
         }
     }
 
+    for tool in &mut manifest.tools {
+        apply_npm_tool_aliases(tool);
+    }
+
     Ok(manifest)
+}
+
+fn apply_npm_tool_aliases(tool: &mut ToolDefinition) {
+    let Some(package_name) = tool.package_name.as_deref() else {
+        return;
+    };
+    if is_qoder_package_alias(package_name) {
+        tool.package_name = Some("@qoder-ai/qodercli".to_string());
+        let bin_path = "node_modules/.bin/qodercli.cmd".to_string();
+        tool.version_command = vec![bin_path.clone(), "--version".to_string()];
+        tool.host_version_command = vec!["qodercli".to_string(), "--version".to_string()];
+        tool.bin_paths = vec![bin_path.clone()];
+        tool.run_command = vec![bin_path.clone()];
+        tool.login_command = vec![bin_path];
+    }
+}
+
+fn is_qoder_package_alias(package_name: &str) -> bool {
+    matches!(
+        package_name.trim().to_ascii_lowercase().as_str(),
+        "qoder" | "qoder@latest" | "@qoder-ai/qodercli" | "@qoder-ai/qodercli@latest"
+    )
 }
 
 fn load_marketplace(app: &AppState) -> Result<MarketplaceFile, AppError> {
@@ -2350,12 +2376,18 @@ pub fn add_custom_tool(
     } else {
         let package_name_val =
             package_name.ok_or_else(|| AppError::Message("NPM 包名不能为空".to_string()))?;
-        let package_name_val = package_name_val.trim().to_string();
+        let mut package_name_val = package_name_val.trim().to_string();
         if package_name_val.is_empty() {
             return Err(AppError::Message("NPM 包名不能为空".to_string()));
         }
+        let bin_name = if is_qoder_package_alias(&package_name_val) {
+            package_name_val = "@qoder-ai/qodercli".to_string();
+            "qodercli".to_string()
+        } else {
+            id_name.clone()
+        };
 
-        let bin_path = format!("node_modules/.bin/{}.cmd", id_name);
+        let bin_path = format!("node_modules/.bin/{}.cmd", bin_name);
 
         ToolDefinition {
             id: tool_id,
@@ -2365,7 +2397,7 @@ pub fn add_custom_tool(
             base_path,
             package_name: Some(package_name_val),
             version_command: vec![bin_path.clone(), "--version".to_string()],
-            host_version_command: vec![id_name.clone(), "--version".to_string()],
+            host_version_command: vec![bin_name, "--version".to_string()],
             bin_paths: vec![bin_path.clone()],
             run_command: vec![bin_path.clone()],
             login_command: vec![bin_path],
@@ -2723,6 +2755,67 @@ async function checkForUpdates(runningProcess, exitListener) {
         assert!(tools
             .iter()
             .any(|tool| tool.id == "freebuff" && !tool.in_manifest));
+    }
+
+    #[test]
+    fn qoder_custom_tool_alias_uses_qodercli_package_and_binary() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(CUSTOM_TOOLS_PATH),
+            r#"{"tools":[{
+              "id":"custom-qoder",
+              "name":"qoder",
+              "kind":"ai-cli",
+              "required":false,
+              "basePath":"tools/custom/custom-qoder",
+              "packageName":"qoder",
+              "versionCommand":["node_modules/.bin/qoder.cmd","--version"],
+              "hostVersionCommand":["qoder","--version"],
+              "binPaths":["node_modules/.bin/qoder.cmd"],
+              "runCommand":["node_modules/.bin/qoder.cmd"],
+              "loginCommand":["node_modules/.bin/qoder.cmd"],
+              "install":{"type":"npm","dependsOn":["node"]}
+            }]}"#,
+        )
+        .unwrap();
+
+        let manifest = load_manifest(&app).unwrap();
+        let qoder = manifest
+            .tools
+            .iter()
+            .find(|tool| tool.id == "custom-qoder")
+            .expect("qoder tool missing");
+        assert_eq!(qoder.package_name.as_deref(), Some("@qoder-ai/qodercli"));
+        assert_eq!(
+            qoder.bin_paths,
+            vec!["node_modules/.bin/qodercli.cmd".to_string()]
+        );
+        assert_eq!(qoder.host_version_command[0], "qodercli");
+    }
+
+    #[test]
+    fn add_custom_qoder_writes_qodercli_package_and_binary() {
+        let (_temp, app) = fixture();
+        let id = add_custom_tool(
+            &app,
+            "qoder".to_string(),
+            "npm",
+            Some("qoder".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(id, "custom-qoder");
+
+        let raw = fs::read_to_string(app.path(CUSTOM_TOOLS_PATH)).unwrap();
+        let custom: CustomToolsFile = serde_json::from_str(&raw).unwrap();
+        let qoder = custom.tools.first().expect("qoder tool missing");
+        assert_eq!(qoder.package_name.as_deref(), Some("@qoder-ai/qodercli"));
+        assert_eq!(
+            qoder.bin_paths,
+            vec!["node_modules/.bin/qodercli.cmd".to_string()]
+        );
+        assert_eq!(qoder.host_version_command[0], "qodercli");
     }
 
     #[test]
