@@ -822,11 +822,24 @@ fn install_npm_tool(
             prepend_path(&mut warmup, &node_root);
             
             // Allow a generous timeout since this might download a large binary
-            if let Some(_output) = run_command_with_timeout(warmup, std::time::Duration::from_secs(300)) {
-                if !combined.is_empty() {
-                    combined.push_str("; ");
+            match run_command_with_timeout(warmup, std::time::Duration::from_secs(900)) {
+                Some(output) => {
+                    if !combined.is_empty() {
+                        combined.push_str("; ");
+                    }
+                    if output.status.success() {
+                        combined.push_str("pre-run warmup complete");
+                    } else {
+                        let out_str = command_output(&output);
+                        combined.push_str(&format!("pre-run warmup failed (可能网络不稳定，安装后请重试): {}", out_str));
+                    }
                 }
-                combined.push_str("pre-run warmup complete");
+                None => {
+                    if !combined.is_empty() {
+                        combined.push_str("; ");
+                    }
+                    combined.push_str("pre-run warmup timed out after 15 minutes");
+                }
             }
         }
     }
@@ -1144,6 +1157,16 @@ fn patch_freebuff_index(app: &AppState, tool: &ToolDefinition) -> Result<Option<
     if raw.contains("Portable AI Dev Kit stream patch") {
         notes.push("freebuff stream pipeline patch already present".to_string());
     } else {
+        // Patch the hardcoded requestTimeout in the same file if possible
+        if let Some(timeout_start) = raw.find("requestTimeout: 20000,") {
+            let mut updated_raw = String::with_capacity(raw.len() + 10);
+            updated_raw.push_str(&raw[..timeout_start]);
+            updated_raw.push_str("requestTimeout: 300000,");
+            updated_raw.push_str(&raw[timeout_start + 22..]);
+            raw = updated_raw;
+            notes.push("freebuff requestTimeout patched to 300000ms".to_string());
+        }
+
         let start = raw
             .find("  res.on('data', (chunk) => {")
             .ok_or_else(|| AppError::Message("无法定位 freebuff 下载进度代码".to_string()))?;
@@ -1153,6 +1176,7 @@ fn patch_freebuff_index(app: &AppState, tool: &ToolDefinition) -> Result<Option<
             .find(end_marker)
             .map(|offset| start + offset)
             .ok_or_else(|| AppError::Message("无法定位 freebuff 解压后续代码".to_string()))?;
+            
         let replacement = r#"  const ProgressTransform = require('stream').Transform
   const progress = new ProgressTransform({
     transform(chunk, _encoding, callback) {
