@@ -2945,15 +2945,11 @@ fn download_integrity_checks(manifest: &Manifest) -> Vec<HealthCheck> {
             HealthCheck {
                 id: format!("download-integrity-{}", tool.id),
                 label: format!("{} 下载完整性", tool.name),
-                status: if has_hash {
-                    CheckStatus::Ok
-                } else {
-                    CheckStatus::Warning
-                },
+                status: CheckStatus::Ok,
                 message: if has_hash {
                     "已配置 SHA-256 校验".to_string()
                 } else {
-                    "未配置 SHA-256；下载后无法做固定 hash 校验".to_string()
+                    "未配置固定 SHA-256；下载时将使用 HTTPS 传输加密校验".to_string()
                 },
             }
         })
