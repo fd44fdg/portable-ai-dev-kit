@@ -15,7 +15,11 @@ old-portable-ai-dev-kit/
 Microsoft/
 .antigravitycli/
 .planning/
+.cachenpm/
+.choccy/
+.orbit/
 1.png
+QQ*.png
 
 # Build artifacts and large files
 *.exe
@@ -27,6 +31,7 @@ Portable-AI-Dev-Kit.exe
 # OS / editor
 Thumbs.db
 .DS_Store
+nul
 *.swp
 *.bak
 *.tmp

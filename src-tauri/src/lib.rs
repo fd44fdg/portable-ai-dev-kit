@@ -6,6 +6,7 @@ use portable::{
     DiagnosticsReport, HealthReport, MarketplaceTool, ToolActionRequest, ToolCommandResult,
 };
 use serde::Serialize;
+use std::env;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,10 +57,19 @@ async fn export_diagnostics_report() -> Result<DiagnosticsReport, AppError> {
 }
 
 #[tauri::command]
-async fn install_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
+async fn install_tool(
+    tool_id: String,
+    timeout_secs: Option<u64>,
+) -> Result<ToolCommandResult, AppError> {
     tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
         let app = AppState::discover()?;
-        tool_action(&app, ToolActionRequest::new(tool_id, "install"))
+        let request = ToolActionRequest::new(tool_id, "install");
+        let request = if let Some(s) = timeout_secs {
+            request.with_timeout(s)
+        } else {
+            request
+        };
+        tool_action(&app, request)
     })
     .await
     .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
@@ -76,10 +86,19 @@ async fn uninstall_tool(tool_id: String) -> Result<ToolCommandResult, AppError> 
 }
 
 #[tauri::command]
-async fn update_tool(tool_id: String) -> Result<ToolCommandResult, AppError> {
+async fn update_tool(
+    tool_id: String,
+    timeout_secs: Option<u64>,
+) -> Result<ToolCommandResult, AppError> {
     tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
         let app = AppState::discover()?;
-        tool_action(&app, ToolActionRequest::new(tool_id, "update"))
+        let request = ToolActionRequest::new(tool_id, "update");
+        let request = if let Some(s) = timeout_secs {
+            request.with_timeout(s)
+        } else {
+            request
+        };
+        tool_action(&app, request)
     })
     .await
     .map_err(|e| AppError::Message(format!("Task join error: {}", e)))?
@@ -199,6 +218,7 @@ async fn install_marketplace_tool(
     id: String,
     name: String,
     package_name: String,
+    _timeout_secs: Option<u64>,
 ) -> Result<ToolCommandResult, AppError> {
     tokio::task::spawn_blocking(move || -> Result<ToolCommandResult, AppError> {
         let app = AppState::discover()?;
@@ -209,6 +229,10 @@ async fn install_marketplace_tool(
 }
 
 pub fn run() {
+    if run_headless_command_or_exit() {
+        return;
+    }
+
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             bootstrap,
@@ -229,4 +253,62 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Portable AI Dev Kit");
+}
+
+fn run_headless_command_or_exit() -> bool {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let Some(command) = args.first().map(String::as_str) else {
+        return false;
+    };
+
+    let result = match command {
+        "--health-check" => run_headless_health_check(),
+        "--export-diagnostics" => run_headless_diagnostics_export(),
+        "--install-tool" => run_headless_tool_install(args.get(1).map(String::as_str)),
+        _ => return false,
+    };
+
+    if let Err(error) = result {
+        eprintln!("{}", error);
+        std::process::exit(1);
+    }
+    true
+}
+
+fn run_headless_health_check() -> Result<(), AppError> {
+    let app = AppState::discover()?;
+    bootstrap_kit(&app)?;
+    let report = check_health(&app)?;
+    println!("health={:?} checks={}", report.summary, report.checks.len());
+    for check in &report.checks {
+        println!("[{:?}] {}: {}", check.status, check.id, check.message);
+    }
+    Ok(())
+}
+
+fn run_headless_diagnostics_export() -> Result<(), AppError> {
+    let app = AppState::discover()?;
+    let report = export_diagnostics(&app)?;
+    println!("diagnostics={}", report.path);
+    Ok(())
+}
+
+fn run_headless_tool_install(tool_id: Option<&str>) -> Result<(), AppError> {
+    let tool_id = tool_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Message("--install-tool 需要提供工具 id".to_string()))?;
+    let app = AppState::discover()?;
+    let result = tool_action(&app, ToolActionRequest::new(tool_id.to_string(), "install"))?;
+    println!(
+        "tool={} action={} success={} message={}",
+        result.tool_id, result.action, result.success, result.message
+    );
+    if !result.output.trim().is_empty() {
+        println!("{}", result.output);
+    }
+    if result.success {
+        Ok(())
+    } else {
+        Err(AppError::Message(result.message))
+    }
 }

@@ -1,7 +1,7 @@
 {
   "loadingApp": "Loading portable environment console...",
   "loadFailed": "Failed to load portable environment",
-  "startupTimeout": "Portable environment startup did not finish within 120 seconds. Export diagnostics or restart the app; if it persists, check Node/npm integrity first.",
+  "startupTimeout": "Portable environment startup timed out. Export diagnostics or restart the app; if it persists, check Node/npm integrity first.",
   "retry": "Retry",
   "retryLoading": "Retrying to load portable environment...",
   "envLoaded": "Loaded portable environment: {{root}}",
@@ -102,5 +102,10 @@
   "toolNotFound": "Unknown tool",
   "emptyToolList": "Tool list is empty. Check config/tool-manifest.json",
   "noActiveTool": "Active tool is missing or invalid",
+  "installTimeout": "Install timeout (seconds)",
+  "installTimeoutDesc": "Maximum wait time for npm tool install/update",
+  "installTimeoutPlaceholder": "Default 600 (10 minutes)",
+  "installElapsed": "Elapsed {{seconds}}s",
+  "cancelInstall": "Cancel install",
   "createdBy": "Created By Deerflow"
 }

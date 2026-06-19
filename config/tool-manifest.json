@@ -24,6 +24,7 @@
         "type": "archive",
         "archiveName": "node-v24.11.1-win-x64.zip",
         "installerType": "zip",
+        "sha256": "5355ae6d7c49eddcfde7d34ac3486820600a831bf81dc3bdca5c8db6a9bb0e76",
         "urls": {
           "global": "https://nodejs.org/dist/v24.11.1/node-v24.11.1-win-x64.zip",
           "china": "https://npmmirror.com/mirrors/node/v24.11.1/node-v24.11.1-win-x64.zip"
@@ -43,6 +44,7 @@
         "type": "archive",
         "archiveName": "mingit-2.53.0.2-64-bit.zip",
         "installerType": "zip",
+        "sha256": "d4bf83d6a860ccae9af44e508e1e00a39f09db6fa78a9ba5543b94d87ca22a29",
         "urls": {
           "global": "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/MinGit-2.53.0.2-64-bit.zip",
           "china": "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/MinGit-2.53.0.2-64-bit.zip"
@@ -96,7 +98,9 @@
       "loginCommand": ["agy.exe", "login"],
       "install": {
         "type": "powershell-script",
-        "scriptUrl": "https://antigravity.google/cli/install.ps1"
+        "scriptUrl": "https://antigravity.google/cli/install.ps1",
+        "scriptArgs": ["--skip-path", "--skip-aliases"],
+        "sha256": "51c2cb4fada22ce0228da71b9506370383d6544bfebcec85fe7616a52b805344"
       }
     }
   ]

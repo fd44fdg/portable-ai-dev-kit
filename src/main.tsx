@@ -100,6 +100,7 @@ type SettingsValues = {
   networkMode: string;
   workspacePath: string;
   autoOpenWorkspace: boolean;
+  installTimeout: number;
 };
 
 function extractErrorMessage(error: unknown, t: (key: string) => string): string {
@@ -125,7 +126,7 @@ function nowStamp(): string {
 
 const FOCUSABLE_SELECTOR =
   'a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex=-1])';
-const BOOTSTRAP_TIMEOUT_MS = 120000;
+const BOOTSTRAP_TIMEOUT_MS = 300000;
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -191,7 +192,8 @@ function App() {
 
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [activeTool, setActiveTool] = useState<string>('');
-  const [busyTool, setBusyTool] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<{ toolId: string; action: string } | null>(null);
+  const busyTool = busyAction?.toolId ?? null;
   const [logEntries, setLogEntries] = useState<LogEntry[]>([
     { ts: nowStamp(), text: t('loadingApp') },
   ]);
@@ -244,9 +246,15 @@ function App() {
     networkMode: 'global',
     workspacePath: 'workspace',
     autoOpenWorkspace: false,
+    installTimeout: 600,
   });
   const [settingsSaving, setSettingsSaving] = useState<boolean>(false);
   const settingsModalRef = useFocusTrap(showSettings);
+
+  // Install elapsed timer
+  const [installElapsed, setInstallElapsed] = useState<number>(0);
+  const installTimerRef = useRef<number | null>(null);
+  const installAbortRef = useRef<AbortController | null>(null);
 
   // Add custom tool modal
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
@@ -342,8 +350,22 @@ function App() {
   ) => {
     if (runActionInFlightRef.current) return;
     runActionInFlightRef.current = true;
-    setBusyTool(toolId);
+    setBusyAction({ toolId, action });
+    setInstallElapsed(0);
     setLog(`${actionLabelFn(action)} ${toolId}...`);
+
+    // Start elapsed timer only for long-running operations (not launch)
+    if (action !== 'launch_tool') {
+      const startTime = Date.now();
+      installTimerRef.current = window.setInterval(() => {
+        setInstallElapsed(Math.floor((Date.now() - startTime) / 1000));
+      }, 1000);
+    }
+
+    // Create abort controller for cancellation
+    const ac = new AbortController();
+    installAbortRef.current = ac;
+
     try {
       const tool = dashboard?.tools.find((item) => item.id === toolId);
       let workspaceDir: string | null = null;
@@ -361,22 +383,63 @@ function App() {
           }
         }
       }
+
+      if (ac.signal.aborted) return;
+
+      const timeoutSecs = (action === 'install_tool' || action === 'update_tool')
+        ? settingsValues.installTimeout
+        : undefined;
       const args =
         action === 'launch_tool'
           ? { toolId, workspaceDir }
-          : { toolId };
+          : { toolId, timeoutSecs };
       const result = await invoke<ToolCommandResult>(action, args);
       if (!isMountedRef.current) return;
       const combined = [result.message, result.output].filter(Boolean).join('\n');
       if (combined) setLog(combined);
-      await load(true, true);
-    } catch (error) {
-      if (isMountedRef.current) { const message = extractErrorMessage(error, t); setLog(message); pushToast(message, 'error'); }
-    } finally {
+
+      // Clear busy state immediately so the UI is responsive.
+      if (installTimerRef.current !== null) {
+        window.clearInterval(installTimerRef.current);
+        installTimerRef.current = null;
+      }
+      installAbortRef.current = null;
       runActionInFlightRef.current = false;
-      if (isMountedRef.current) setBusyTool(null);
+      if (isMountedRef.current) {
+        setBusyAction(null);
+        setInstallElapsed(0);
+      }
+
+      // Refresh dashboard in the background (launch doesn't need it).
+      if (action !== 'launch_tool') {
+        try {
+          await load(true, true);
+        } catch (refreshError) {
+          if (isMountedRef.current) {
+            const msg = extractErrorMessage(refreshError, t);
+            setLog(`${t('refreshFailed')}: ${msg}`);
+          }
+        }
+      }
+    } catch (error) {
+      if (!isMountedRef.current) return;
+      const message = extractErrorMessage(error, t);
+      setLog(message);
+      pushToast(message, 'error');
+    } finally {
+      // Ensure cleanup even on early returns (e.g. cancelled dialog).
+      if (installTimerRef.current !== null) {
+        window.clearInterval(installTimerRef.current);
+        installTimerRef.current = null;
+      }
+      installAbortRef.current = null;
+      runActionInFlightRef.current = false;
+      if (isMountedRef.current) {
+        setBusyAction(null);
+        setInstallElapsed(0);
+      }
     }
-  }, [dashboard, load, t, setLog, pushToast]);
+  }, [dashboard, load, t, setLog, pushToast, settingsValues.installTimeout]);
 
   useEffect(() => {
     if (!showAddModal && !showMarketplace && !showSettings) return;
@@ -400,6 +463,7 @@ function App() {
     ),
     [marketplaceTools, marketplaceSearch],
   );
+  const marketplaceInstalling = marketplaceBusy !== null;
 
   async function openMarketplace() {
     setShowMarketplace(true);
@@ -418,6 +482,7 @@ function App() {
   }
 
   async function handleMarketplaceInstall(tool: MarketplaceTool) {
+    if (marketplaceBusy !== null) return;
     setMarketplaceBusy(tool.id);
     setLog(`${t('installingFromMarket')}: ${tool.name}...`);
     try {
@@ -452,6 +517,7 @@ function App() {
         networkMode: dashboard.networkMode,
         workspacePath: dashboard.workspacePath,
         autoOpenWorkspace: dashboard.autoOpenWorkspace,
+        installTimeout: settingsValues.installTimeout,
       });
     }
   }
@@ -794,29 +860,43 @@ function App() {
                 disabled={busyTool === active.id}
                 onClick={() => runAction('install_tool', active.id)}
               >
-                {busyTool === active.id ? <Activity className='spin' size={17} /> : <Download size={17} />}
-                {busyTool === active.id ? t('actionInstalling') : t('actionInstall')}
+                {busyAction?.toolId === active.id && busyAction.action === 'install_tool' ? <Activity className='spin' size={17} /> : <Download size={17} />}
+                {busyAction?.toolId === active.id && busyAction.action === 'install_tool' ? t('actionInstalling') : t('actionInstall')}
               </button>
+              {busyAction?.toolId === active.id && (busyAction.action === 'install_tool' || busyAction.action === 'update_tool') && (
+                <span className='install-timer'>
+                  {t('installElapsed', { seconds: installElapsed })}
+                </span>
+              )}
+              {busyAction?.toolId === active.id && (busyAction.action === 'install_tool' || busyAction.action === 'update_tool') && (
+                <button
+                  className='cancel-install-btn'
+                  onClick={() => installAbortRef.current?.abort()}
+                >
+                  <X size={15} /> {t('cancelInstall')}
+                </button>
+              )}
               <button
                 disabled={busyTool === active.id || active.status === 'missing'}
                 onClick={() => runAction('update_tool', active.id)}
               >
-                {busyTool === active.id ? <Activity className='spin' size={17} /> : <RefreshCw size={17} />}
-                {busyTool === active.id ? t('actionProcessing') : t('actionUpdate')}
+                {busyAction?.toolId === active.id && busyAction.action === 'update_tool' ? <Activity className='spin' size={17} /> : <RefreshCw size={17} />}
+                {busyAction?.toolId === active.id && busyAction.action === 'update_tool' ? t('actionProcessing') : t('actionUpdate')}
               </button>
               <button
                 disabled={busyTool === active.id || active.status === 'missing' || active.kind !== 'ai-cli'}
                 onClick={() => runAction('launch_tool', active.id)}
               >
-                <Play size={17} /> {t('actionRun')}
+                {busyAction?.toolId === active.id && busyAction.action === 'launch_tool' ? <Activity className='spin' size={17} /> : <Play size={17} />}
+                {busyAction?.toolId === active.id && busyAction.action === 'launch_tool' ? t('actionProcessing') : t('actionRun')}
               </button>
               <button
                 className='danger'
                 disabled={busyTool === active.id || active.status === 'missing'}
                 onClick={() => runAction('uninstall_tool', active.id)}
               >
-                {busyTool === active.id ? <Activity className='spin' size={17} /> : <Trash2 size={17} />}
-                {busyTool === active.id ? t('actionProcessing') : t('actionUninstall')}
+                {busyAction?.toolId === active.id && busyAction.action === 'uninstall_tool' ? <Activity className='spin' size={17} /> : <Trash2 size={17} />}
+                {busyAction?.toolId === active.id && busyAction.action === 'uninstall_tool' ? t('actionProcessing') : t('actionUninstall')}
               </button>
               {active.id.startsWith('custom-') && (
                 <button
@@ -830,7 +910,7 @@ function App() {
                       confirmed = false;
                     }
                     if (!confirmed) return;
-                    setBusyTool(active.id);
+                    setBusyAction({ toolId: active.id, action: 'delete_tool' });
                     setLog(`${t('deletingCustomTool')}: ${active.name}...`);
                     try {
                       const nextDashboard = await invoke<Dashboard>('delete_custom_tool', { toolId: active.id });
@@ -841,7 +921,7 @@ function App() {
                     } catch (error) {
                       if (isMountedRef.current) { const message = extractErrorMessage(error, t); setLog(message); pushToast(message, 'error'); }
                     } finally {
-                      if (isMountedRef.current) setBusyTool(null);
+                      if (isMountedRef.current) setBusyAction(null);
                     }
                   }}
                 >
@@ -959,6 +1039,24 @@ function App() {
                   />
                   <span>{t('autoOpenWorkspaceLabel')}</span>
                 </label>
+              </div>
+
+              {/* Install Timeout */}
+              <div className='form-group'>
+                <label>{t('installTimeout')}</label>
+                <input
+                  type='number'
+                  min={60}
+                  max={3600}
+                  step={60}
+                  value={settingsValues.installTimeout}
+                  onChange={(e) => setSettingsValues((v) => ({
+                    ...v,
+                    installTimeout: Math.max(60, Math.min(3600, Number(e.target.value) || 600)),
+                  }))}
+                  placeholder={t('installTimeoutPlaceholder')}
+                />
+                <small className='form-hint'>{t('installTimeoutDesc')}</small>
               </div>
 
               {/* Language */}
@@ -1175,7 +1273,7 @@ function App() {
                         ) : (
                           <button
                             className='primary'
-                            disabled={marketplaceBusy === tool.id}
+                            disabled={marketplaceInstalling}
                             onClick={() => handleMarketplaceInstall(tool)}
                           >
                             {marketplaceBusy === tool.id ? (

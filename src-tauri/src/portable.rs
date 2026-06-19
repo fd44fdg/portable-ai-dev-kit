@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
-    env, fs, io,
-    path::{Path, PathBuf},
+    env, fs,
+    io::{self, Read},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::{LazyLock, Mutex},
 };
@@ -10,9 +11,15 @@ use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 static STATE_LOCK: Mutex<()> = Mutex::new(());
+static ACTION_LOCK: Mutex<()> = Mutex::new(());
 static BOOTSTRAPPED_ROOTS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+const NPM_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+const EXPAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const SCRIPT_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const MANIFEST_PATH: &str = "config/tool-manifest.json";
 const SETTINGS_PATH: &str = "config/app-settings.json";
 const STATE_PATH: &str = "state/tool-state.json";
@@ -165,6 +172,10 @@ pub struct InstallDefinition {
     #[serde(default)]
     pub urls: BTreeMap<String, String>,
     pub script_url: Option<String>,
+    #[serde(default)]
+    pub script_args: Vec<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -301,6 +312,7 @@ pub struct DiagnosticsReport {
 pub struct ToolActionRequest {
     tool_id: String,
     action: String,
+    timeout_secs: Option<u64>,
 }
 
 impl ToolActionRequest {
@@ -308,7 +320,13 @@ impl ToolActionRequest {
         Self {
             tool_id,
             action: action.to_string(),
+            timeout_secs: None,
         }
+    }
+
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_secs = Some(secs);
+        self
     }
 }
 
@@ -441,6 +459,11 @@ fn check_health_with_state(
     );
     checks.extend(package_integrity_checks(app));
 
+    // Write-speed probe (only on force refresh, not every load).
+    if let Some(speed_check) = probe_write_speed(app, force) {
+        checks.push(speed_check);
+    }
+
     if let Ok(metadata) = fs::metadata(&app.root) {
         checks.push(HealthCheck {
             id: "root-writable".to_string(),
@@ -473,6 +496,8 @@ fn check_health_with_state(
         },
     });
 
+    checks.extend(download_integrity_checks(manifest));
+
     for tool in &manifest.tools {
         let view = tool_view(app, tool, state, force)?;
         if tool.required && view.status != ToolStatus::Ready {
@@ -503,14 +528,21 @@ pub fn tool_action(
     app: &AppState,
     request: ToolActionRequest,
 ) -> Result<ToolCommandResult, AppError> {
+    let _action_guard = ACTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     bootstrap_kit(app)?;
     let manifest = load_manifest(app)?;
     let settings = load_settings(app)?;
     let tool = find_tool(&manifest, &request.tool_id)?;
 
+    let timeout = request
+        .timeout_secs
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(NPM_INSTALL_TIMEOUT);
     match request.action.as_str() {
-        "install" => install_tool(app, &manifest, &settings, tool),
-        "update" => install_tool(app, &manifest, &settings, tool),
+        "install" => install_tool(app, &manifest, &settings, tool, timeout),
+        "update" => install_tool(app, &manifest, &settings, tool, timeout),
         "uninstall" => uninstall_tool(app, tool),
         _ => Err(AppError::Message(format!(
             "未知工具操作：{}",
@@ -706,6 +738,7 @@ fn install_tool(
     manifest: &Manifest,
     settings: &Settings,
     tool: &ToolDefinition,
+    timeout: std::time::Duration,
 ) -> Result<ToolCommandResult, AppError> {
     let mut state = load_state(app)?;
     for dependency in &tool.install.depends_on {
@@ -726,7 +759,7 @@ fn install_tool(
     save_state(app, &state)?;
 
     match tool.install.install_type {
-        InstallType::Npm => install_npm_tool(app, settings, tool),
+        InstallType::Npm => install_npm_tool(app, settings, tool, timeout),
         InstallType::Archive => install_archive_tool(app, manifest, settings, tool),
         InstallType::PowershellScript => install_powershell_script_tool(app, tool),
     }
@@ -736,7 +769,94 @@ fn install_npm_tool(
     app: &AppState,
     settings: &Settings,
     tool: &ToolDefinition,
+    timeout: std::time::Duration,
 ) -> Result<ToolCommandResult, AppError> {
+    let package_name = tool
+        .package_name
+        .clone()
+        .ok_or_else(|| AppError::Message(format!("{} 未配置 npm 包", tool.name)))?;
+
+    // Install on the local SSD first; the heavy npm I/O must not hit the
+    // (possibly slow) portable drive. On failure this returns an error with
+    // a Chinese message and the staging dir is already cleaned up.
+    let staging = install_npm_tool_to_staging(app, settings, tool, timeout)?;
+
+    // Move the finished tree onto the portable drive, with rollback. On
+    // failure the previous install is restored and we surface an error.
+    if let Err(error) = swap_npm_install_into_place(app, tool, staging) {
+        // Preserve prior error semantics: persist a failure state and return
+        // a ToolCommandResult so the UI shows the message.
+        persist_action_state(
+            app,
+            tool,
+            false,
+            Some(package_name.clone()),
+            &error.to_string(),
+        )?;
+        return Ok(ToolCommandResult {
+            tool_id: tool.id.clone(),
+            action: "install".to_string(),
+            success: false,
+            message: format!("{} 安装失败", tool.name),
+            output: error.to_string(),
+        });
+    }
+
+    let mut combined = String::new();
+    if package_name == "freebuff" {
+        if let Some(patch_note) = patch_freebuff_index(app, tool)? {
+            combined.push_str(&patch_note);
+        }
+    }
+
+    // Pre-run warmup: Execute the tool's version command to trigger any internal 
+    // binary downloads (e.g. freebuff downloading its 49.6MB core).
+    if !tool.version_command.is_empty() {
+        let exe = resolve_tool_relative(app, tool, &tool.version_command[0]);
+        if exe.exists() {
+            let mut warmup = std::process::Command::new(&exe);
+            warmup.args(&tool.version_command[1..]);
+            warmup.current_dir(app.path(&tool.base_path));
+            apply_portable_env(app, &mut warmup);
+            let node_root = app.path("apps/node");
+            prepend_path(&mut warmup, &node_root);
+            
+            // Allow a generous timeout since this might download a large binary
+            if let Some(_output) = run_command_with_timeout(warmup, std::time::Duration::from_secs(300)) {
+                if !combined.is_empty() {
+                    combined.push_str("; ");
+                }
+                combined.push_str("pre-run warmup complete");
+            }
+        }
+    }
+
+    persist_action_state(app, tool, true, Some(package_name.clone()), &combined)?;
+
+    Ok(ToolCommandResult {
+        tool_id: tool.id.clone(),
+        action: "install".to_string(),
+        success: true,
+        message: format!("{} 已安装", tool.name),
+        output: combined,
+    })
+}
+
+/// Install an npm AI-CLI package into a staging directory on the local SSD
+/// (env::temp_dir()) instead of directly onto the (possibly slow) portable
+/// drive. Returns the staging path on success. The caller is responsible for
+/// moving the staging tree into the final tool base path.
+///
+/// Doing the heavy npm I/O on the local drive sidesteps the small-file write
+/// latency of slow USB/removable drives, which previously caused installs to
+/// blow past NPM_INSTALL_TIMEOUT. The npm *cache* is also pointed at a local
+/// dir for the same reason.
+fn install_npm_tool_to_staging(
+    app: &AppState,
+    settings: &Settings,
+    tool: &ToolDefinition,
+    timeout: std::time::Duration,
+) -> Result<PathBuf, AppError> {
     let node_root = app.path("apps/node");
     validate_portable_npm(app).map_err(AppError::Message)?;
     let package_name = tool
@@ -744,60 +864,209 @@ fn install_npm_tool(
         .as_ref()
         .ok_or_else(|| AppError::Message(format!("{} 未配置 npm 包", tool.name)))?;
     let registry = resolve_registry(app, settings)?;
-    let tool_root = app.path(&tool.base_path);
-    fs::create_dir_all(&tool_root)?;
 
-    if !tool_root.join("package.json").exists() {
-        fs::write(
-            tool_root.join("package.json"),
-            "{\"name\":\"portable-ai-tool\",\"private\":true}\n",
-        )?;
-    }
+    // Stage on the LOCAL drive (env::temp_dir()), not on the portable drive.
+    let staging_root = env::temp_dir()
+        .join("portable-ai-dev-kit")
+        .join("npm-staging");
+    fs::create_dir_all(&staging_root)?;
+    let unique = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "t".to_string())
+        .replace(':', "-");
+    let staging = staging_root.join(format!("{}-{}", tool.id, unique));
+    fs::create_dir_all(&staging)?;
+    fs::write(
+        staging.join("package.json"),
+        "{\"name\":\"portable-ai-tool\",\"private\":true}\n",
+    )?;
+
+    // Local npm cache so cache reads/writes never hit the slow drive.
+    let local_cache = env::temp_dir()
+        .join("portable-ai-dev-kit")
+        .join("npm-cache");
+    fs::create_dir_all(&local_cache)?;
 
     let mut command = portable_npm_command(app)?;
     command
         .arg("install")
         .arg("--prefix")
-        .arg(display_path(&tool_root))
+        .arg(display_path(&staging))
         .arg(package_name)
         .arg("--no-fund")
         .arg("--no-audit")
         .arg("--registry")
         .arg(&registry)
-        .current_dir(display_path(&tool_root));
+        .current_dir(display_path(&staging));
     apply_portable_env(app, &mut command);
+    // Override the cache to the LOCAL drive (apply_portable_env set it to the
+    // portable drive's cache/npm). Set AFTER apply_portable_env so we win.
+    command.env("NPM_CONFIG_CACHE", display_path(&local_cache));
     prepend_path(&mut command, &node_root);
 
-    let output = command.output()?;
-    let mut combined = command_output(&output);
-    let success = output.status.success();
-    if success && package_name == "freebuff" {
-        if let Some(patch_note) = patch_freebuff_index(app, tool)? {
-            if !combined.is_empty() {
-                combined.push_str("\n\n");
+    let output = match run_command_with_timeout(command, timeout) {
+        Some(output) => output,
+        None => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(AppError::Message(format!(
+                "{} 安装超时，请检查网络或 npm 源后重试。",
+                tool.name
+            )));
+        }
+    };
+    let combined = command_output(&output);
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(AppError::Message(format!(
+            "{} 安装失败\n{}",
+            tool.name, combined
+        )));
+    }
+
+    // Sanity: confirm the package actually materialized.
+    let bin_name = tool
+        .package_name
+        .as_deref()
+        .and_then(|p| {
+            p.split('@').next().map(|scope| {
+                // package_name may be "@scope/name@latest" or "name@latest"
+                let trimmed = scope.trim_start_matches('@');
+                trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
+            })
+        })
+        .unwrap_or_default();
+    if !staging.join("node_modules").exists() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(AppError::Message(format!(
+            "{} 安装后未生成 node_modules\n{}",
+            tool.name, combined
+        )));
+    }
+    let _ = bin_name; // only used for the existence check above if you wish to extend
+
+    Ok(staging)
+}
+
+/// Move a freshly-installed staging tree into the tool's final base path on
+/// the portable drive, with rollback to the previous install on failure.
+///
+/// `staging` must contain the new `node_modules` (+ package.json). The previous
+/// install, if any, is preserved under <tool_id>-backup until the new tree is
+/// confirmed in place; it is removed on success and restored on failure.
+fn swap_npm_install_into_place(
+    app: &AppState,
+    tool: &ToolDefinition,
+    staging: PathBuf,
+) -> Result<(), AppError> {
+    let destination = app.path(&tool.base_path);
+    let backup = app.path(&format!("cache/extract/{}-backup", tool.id));
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir_all(app.path("cache/extract"))?;
+
+    // Remove any stale backup from a prior run.
+    if backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
+    }
+
+    // Preserve current install as rollback target. Rename (not copy) so this
+    // is cheap even on a slow drive.
+    let had_existing = destination.exists();
+    if had_existing {
+        fs::rename(&destination, &backup)?;
+    }
+
+    if let Err(error) = fs::rename(&staging, &destination) {
+        // Cross-device rename (os error 17): staging is on local SSD but
+        // destination is on the portable USB drive. Fall back to recursive
+        // copy + delete instead of failing the entire install.
+        if error.kind() == io::ErrorKind::CrossesDevices {
+            // Restore destination so robocopy can use it as a baseline for differential sync
+            if had_existing && backup.exists() {
+                let _ = fs::rename(&backup, &destination);
             }
-            combined.push_str(&patch_note);
+
+            #[cfg(target_os = "windows")]
+            {
+                let status = Command::new("robocopy")
+                    .arg(display_path(&staging))
+                    .arg(display_path(&destination))
+                    .arg("/MIR")
+                    .arg("/MT:32")
+                    .arg("/NDL")
+                    .arg("/NFL")
+                    .arg("/NJH")
+                    .arg("/NJS")
+                    .status();
+
+                if let Ok(st) = status {
+                    let code = st.code().unwrap_or(8);
+                    if code < 8 {
+                        let _ = fs::remove_dir_all(&staging);
+                        if backup.exists() {
+                            let _ = fs::remove_dir_all(&backup);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Fallback: if robocopy failed or not on Windows, we need destination to be empty
+            // for copy_dir_all. We move it back to backup.
+            if had_existing && destination.exists() {
+                let _ = fs::rename(&destination, &backup);
+            }
+
+            match copy_dir_all(&staging, &destination) {
+                Ok(()) => {
+                    let _ = fs::remove_dir_all(&staging);
+                    if backup.exists() {
+                        let _ = fs::remove_dir_all(&backup);
+                    }
+                    return Ok(());
+                }
+                Err(copy_err) => {
+                    let _ = fs::remove_dir_all(&destination);
+                    if had_existing && backup.exists() {
+                        let _ = fs::rename(&backup, &destination);
+                    }
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(copy_err);
+                }
+            }
+        }
+
+        // Roll back to the previous install if we can.
+        if had_existing && backup.exists() && !destination.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        // Clean up the staging dir we still own.
+        let _ = fs::remove_dir_all(&staging);
+        return Err(AppError::Io(error));
+    }
+
+    // New tree is in place. Drop the backup.
+    if backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), AppError> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(&entry.path(), &target)?;
         }
     }
-    persist_action_state(
-        app,
-        tool,
-        success,
-        Some(package_name.to_string()),
-        &combined,
-    )?;
-
-    Ok(ToolCommandResult {
-        tool_id: tool.id.clone(),
-        action: "install".to_string(),
-        success,
-        message: if success {
-            format!("{} 已安装", tool.name)
-        } else {
-            format!("{} 安装失败", tool.name)
-        },
-        output: combined,
-    })
+    Ok(())
 }
 
 fn portable_npm_command(app: &AppState) -> Result<Command, AppError> {
@@ -823,23 +1092,40 @@ fn portable_npm_command(app: &AppState) -> Result<Command, AppError> {
 
 fn validate_portable_npm(app: &AppState) -> Result<String, String> {
     let node_root = app.path("apps/node");
-    let mut command = portable_npm_command(app).map_err(|error| error.to_string())?;
-    command
-        .arg("--version")
-        .current_dir(display_path(&node_root));
+
+    // Fast path: read npm version directly from package.json (O(1) I/O)
+    let mut npm_version = String::new();
+    let npm_pkg = node_root.join("node_modules").join("npm").join("package.json");
+    if let Ok(content) = fs::read_to_string(&npm_pkg) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(ver) = v.get("version").and_then(|v| v.as_str()) {
+                npm_version = ver.to_string();
+            }
+        }
+    }
+
+    // Verify node.exe can actually run (fast execution, no node_modules I/O)
+    let node_exe = find_existing_path(&node_root, &["node.exe"])
+        .ok_or_else(|| "Node 可执行文件未找到".to_string())?;
+    let mut command = Command::new(&node_exe);
+    command.arg("--version").current_dir(display_path(&node_root));
     apply_portable_env(app, &mut command);
     prepend_path(&mut command, &node_root);
 
-    let output = run_command_with_timeout(command, std::time::Duration::from_secs(5))
+    let output = run_command_with_timeout(command, std::time::Duration::from_secs(15))
         .ok_or_else(|| "便携 Node/npm 校验超时，请重装 Node.js。".to_string())?;
     if output.status.success() {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok(version);
+        if !npm_version.is_empty() {
+            return Ok(npm_version);
+        } else {
+            // Fallback if package.json was unreadable but node works
+            return Ok("unknown".to_string());
+        }
     }
 
     let combined = command_output(&output);
     Err(format!(
-        "便携 Node/npm 不完整或无法运行。请先在界面中卸载并重新安装 Node.js，然后再安装 AI CLI。\n{}",
+        "便携 Node 不完整或无法运行。请先在界面中卸载并重新安装 Node.js，然后再安装 AI CLI。\n{}",
         combined
     ))
 }
@@ -1014,6 +1300,8 @@ fn install_archive_tool(
         .ok_or_else(|| AppError::Message(format!("{} 未配置归档文件名", tool.name)))?;
     let download_path = app.path(&format!("cache/downloads/{}", archive_name));
     let destination = app.path(&tool.base_path);
+    let staging = app.path(&format!("cache/extract/{}-staging", tool.id));
+    let backup = app.path(&format!("cache/extract/{}-backup", tool.id));
     fs::create_dir_all(download_path.parent().unwrap_or(&app.root))?;
 
     if !download_path.exists() {
@@ -1033,7 +1321,21 @@ fn install_archive_tool(
                 escape_single_quote(&display_path(&download_path)),
                 escape_single_quote(&display_path(&download_path))
             ));
-        let output = download.output()?;
+        let output = match run_command_with_timeout(download, DOWNLOAD_TIMEOUT) {
+            Some(output) => output,
+            None => {
+                let _ = fs::remove_file(&download_path);
+                let combined = format!("{} 下载超时，请检查网络后重试。", tool.name);
+                persist_action_state(app, tool, false, Some(url.to_string()), &combined)?;
+                return Ok(ToolCommandResult {
+                    tool_id: tool.id.clone(),
+                    action: "install".to_string(),
+                    success: false,
+                    message: format!("{} 下载超时", tool.name),
+                    output: combined,
+                });
+            }
+        };
         if !output.status.success() {
             // Drop any half-written file so a subsequent retry redownloads.
             let _ = fs::remove_file(&download_path);
@@ -1048,27 +1350,81 @@ fn install_archive_tool(
             });
         }
     }
-
-    if destination.exists() {
-        fs::remove_dir_all(&destination)?;
+    if let Err(error) = verify_download_integrity(tool, &download_path) {
+        let _ = fs::remove_file(&download_path);
+        let combined = error.to_string();
+        persist_action_state(app, tool, false, Some(url.to_string()), &combined)?;
+        return Ok(ToolCommandResult {
+            tool_id: tool.id.clone(),
+            action: "install".to_string(),
+            success: false,
+            message: format!("{} 下载校验失败", tool.name),
+            output: combined,
+        });
     }
-    fs::create_dir_all(&destination)?;
 
-    let mut expand = Command::new("powershell.exe");
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    if backup.exists() {
+        fs::remove_dir_all(&backup)?;
+    }
+    fs::create_dir_all(&staging)?;
+
+    let local_archive = prepare_local_archive_copy(&download_path, archive_name)?;
+    let mut expand = Command::new("tar.exe");
     expand
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(format!(
-            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            escape_single_quote(&display_path(&download_path)),
-            escape_single_quote(&display_path(&destination))
-        ));
-    let output = expand.output()?;
-    flatten_single_root(&destination)?;
-    let combined = command_output(&output);
-    let success = output.status.success();
+        .arg("-xf")
+        .arg(display_path(&local_archive))
+        .arg("-C")
+        .arg(display_path(&staging));
+    let output = match run_command_with_timeout(expand, EXPAND_TIMEOUT) {
+        Some(output) => output,
+        None => {
+            let _ = fs::remove_dir_all(&staging);
+            let combined = format!(
+                "{} 解压超时，请确认移动盘写入速度，或删除缓存后重试。",
+                tool.name
+            );
+            persist_action_state(app, tool, false, Some(url.to_string()), &combined)?;
+            return Ok(ToolCommandResult {
+                tool_id: tool.id.clone(),
+                action: "install".to_string(),
+                success: false,
+                message: format!("{} 解压超时", tool.name),
+                output: combined,
+            });
+        }
+    };
+    let mut combined = command_output(&output);
+    let success = output.status.success()
+        || (tar_output_only_has_timestamp_warnings(&output) && directory_has_entries(&staging)?);
+    if success && !output.status.success() {
+        combined = format!(
+            "{}\n\n已忽略 tar.exe 时间戳恢复警告；文件内容已解压完成。",
+            combined
+        );
+    }
+    if success {
+        flatten_single_root(&staging)?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if destination.exists() {
+            fs::rename(&destination, &backup)?;
+        }
+        if let Err(error) = fs::rename(&staging, &destination) {
+            if backup.exists() && !destination.exists() {
+                let _ = fs::rename(&backup, &destination);
+            }
+            return Err(error.into());
+        }
+        if backup.exists() {
+            fs::remove_dir_all(&backup)?;
+        }
+    } else {
+        let _ = fs::remove_dir_all(&staging);
+    }
     persist_action_state(app, tool, success, Some(url.to_string()), &combined)?;
 
     Ok(ToolCommandResult {
@@ -1118,7 +1474,21 @@ fn install_powershell_script_tool(
             escape_single_quote(&display_path(&script_path)),
             escape_single_quote(&display_path(&script_path))
         ));
-    let download_output = download.output()?;
+    let download_output = match run_command_with_timeout(download, DOWNLOAD_TIMEOUT) {
+        Some(output) => output,
+        None => {
+            let _ = fs::remove_file(&script_path);
+            let combined = format!("{} 脚本下载超时，请检查网络后重试。", tool.name);
+            persist_action_state(app, tool, false, Some(script_url.to_string()), &combined)?;
+            return Ok(ToolCommandResult {
+                tool_id: tool.id.clone(),
+                action: "install".to_string(),
+                success: false,
+                message: format!("{} 脚本下载超时", tool.name),
+                output: combined,
+            });
+        }
+    };
     if !download_output.status.success() {
         let _ = fs::remove_file(&script_path);
         let combined = command_output(&download_output);
@@ -1128,6 +1498,18 @@ fn install_powershell_script_tool(
             action: "install".to_string(),
             success: false,
             message: format!("{} 脚本下载失败", tool.name),
+            output: combined,
+        });
+    }
+    if let Err(error) = verify_download_integrity(tool, &script_path) {
+        let _ = fs::remove_file(&script_path);
+        let combined = error.to_string();
+        persist_action_state(app, tool, false, Some(script_url.to_string()), &combined)?;
+        return Ok(ToolCommandResult {
+            tool_id: tool.id.clone(),
+            action: "install".to_string(),
+            success: false,
+            message: format!("{} 脚本校验失败", tool.name),
             output: combined,
         });
     }
@@ -1141,10 +1523,27 @@ fn install_powershell_script_tool(
         .arg(display_path(&script_path))
         .arg("--dir")
         .arg(display_path(&destination));
+    for arg in &tool.install.script_args {
+        run.arg(arg);
+    }
 
     apply_portable_env(app, &mut run);
 
-    let run_output = run.output()?;
+    let run_output = match run_command_with_timeout(run, SCRIPT_INSTALL_TIMEOUT) {
+        Some(output) => output,
+        None => {
+            let _ = fs::remove_file(&script_path);
+            let combined = format!("{} 安装脚本执行超时，请检查脚本源后重试。", tool.name);
+            persist_action_state(app, tool, false, Some(script_url.to_string()), &combined)?;
+            return Ok(ToolCommandResult {
+                tool_id: tool.id.clone(),
+                action: "install".to_string(),
+                success: false,
+                message: format!("{} 安装脚本执行超时", tool.name),
+                output: combined,
+            });
+        }
+    };
     let combined = command_output(&run_output);
     let success = run_output.status.success();
 
@@ -1201,26 +1600,42 @@ fn tool_view(
         ToolStatus::Missing
     };
     let mut persisted = state.tools.get(&tool.id).cloned().unwrap_or_default();
+    let mut current_error = None;
     if tool.id == "node" && status == ToolStatus::Ready {
         if let Err(error) = validate_portable_npm(app) {
             status = ToolStatus::Partial;
-            persisted.last_error = Some(error.chars().take(2000).collect());
+            current_error = Some(error.chars().take(2000).collect());
         } else {
             persisted.last_error = None;
         }
     }
-    let self_updating = tool.package_name.as_deref() == Some("freebuff");
     let detected_version = if status == ToolStatus::Ready {
-        if force || self_updating || persisted.installed_version.is_none() {
+        if force
+            || persisted.installed_version.is_none()
+            || persisted.last_error.is_some()
+        {
             let detected = detect_version(app, tool);
-            persisted.installed_version = detected.clone();
-            detected
+            if detected.is_some() {
+                persisted.installed_version = detected.clone();
+            }
+            persisted.last_error = None;
+            detected.or_else(|| persisted.installed_version.clone())
         } else {
             persisted.installed_version.clone()
         }
     } else {
         None
     };
+    if status != ToolStatus::Ready {
+        if let Some(error) = current_error {
+            persisted.last_error = Some(error);
+        } else if status == ToolStatus::Partial {
+            persisted.last_error = Some(incomplete_install_message(tool));
+        } else if persisted.installed_version.is_some() || persisted.installed_at.is_some() {
+            persisted.last_error = Some(format!("未找到安装目录：{}", display_path(&base)));
+        }
+        persisted.installed_version = None;
+    }
     let host_version = if tool.host_version_command.is_empty() {
         None
     } else if force {
@@ -1246,7 +1661,7 @@ fn tool_view(
         kind: tool.kind.clone(),
         required: tool.required,
         status,
-        installed_version: detected_version.or(persisted.installed_version),
+        installed_version: detected_version,
         wanted_version: persisted
             .wanted_version
             .or_else(|| tool.package_name.clone()),
@@ -1259,11 +1674,63 @@ fn tool_view(
     })
 }
 
+fn prepare_local_archive_copy(source: &Path, archive_name: &str) -> Result<PathBuf, AppError> {
+    let local_dir = env::temp_dir().join("portable-ai-dev-kit").join("archives");
+    fs::create_dir_all(&local_dir)?;
+    let local_path = local_dir.join(archive_name);
+
+    let should_copy = match (fs::metadata(source), fs::metadata(&local_path)) {
+        (Ok(source_meta), Ok(local_meta)) => source_meta.len() != local_meta.len(),
+        (Ok(_), Err(_)) => true,
+        (Err(error), _) => return Err(error.into()),
+    };
+
+    if should_copy {
+        fs::copy(source, &local_path)?;
+    }
+
+    Ok(local_path)
+}
+
+fn directory_has_entries(path: &Path) -> Result<bool, AppError> {
+    Ok(fs::read_dir(path)?.next().is_some())
+}
+
+fn tar_output_only_has_timestamp_warnings(output: &std::process::Output) -> bool {
+    if !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut saw_warning = false;
+    for line in stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if !line.contains("Can't restore time: Invalid argument") {
+            return false;
+        }
+        saw_warning = true;
+    }
+    saw_warning
+}
+
+fn incomplete_install_message(tool: &ToolDefinition) -> String {
+    if tool.bin_paths.is_empty() {
+        format!("{} 安装目录存在，但未配置启动入口。", tool.name)
+    } else {
+        format!(
+            "{} 安装目录存在，但未找到启动入口：{}",
+            tool.name,
+            tool.bin_paths.join(", ")
+        )
+    }
+}
+
 fn run_command_with_timeout(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> Option<std::process::Output> {
-    use std::io::Read;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::thread;
 
@@ -1280,8 +1747,7 @@ fn run_command_with_timeout(
         let buf = Arc::clone(&stdout_buf);
         move |mut pipe| {
             thread::spawn(move || {
-                let mut local = Vec::new();
-                let _ = pipe.read_to_end(&mut local);
+                let local = read_pipe_capped(&mut pipe);
                 if let Ok(mut guard) = buf.lock() {
                     guard.extend(local);
                 }
@@ -1292,8 +1758,7 @@ fn run_command_with_timeout(
         let buf = Arc::clone(&stderr_buf);
         move |mut pipe| {
             thread::spawn(move || {
-                let mut local = Vec::new();
-                let _ = pipe.read_to_end(&mut local);
+                let local = read_pipe_capped(&mut pipe);
                 if let Ok(mut guard) = buf.lock() {
                     guard.extend(local);
                 }
@@ -1307,6 +1772,11 @@ fn run_command_with_timeout(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if start.elapsed() >= timeout {
+                    #[cfg(target_os = "windows")]
+                    let _ = std::process::Command::new("taskkill")
+                        .args(&["/F", "/T", "/PID", &child.id().to_string()])
+                        .output();
+                    
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -1314,6 +1784,11 @@ fn run_command_with_timeout(
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(_) => {
+                #[cfg(target_os = "windows")]
+                let _ = std::process::Command::new("taskkill")
+                    .args(&["/F", "/T", "/PID", &child.id().to_string()])
+                    .output();
+                
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -1321,11 +1796,13 @@ fn run_command_with_timeout(
         }
     };
 
-    if let Some(handle) = stdout_thread {
-        let _ = handle.join();
-    }
-    if let Some(handle) = stderr_thread {
-        let _ = handle.join();
+    if status.is_some() {
+        if let Some(handle) = stdout_thread {
+            let _ = handle.join();
+        }
+        if let Some(handle) = stderr_thread {
+            let _ = handle.join();
+        }
     }
 
     let status = status?;
@@ -1338,7 +1815,41 @@ fn run_command_with_timeout(
     })
 }
 
+fn read_pipe_capped<R: Read>(pipe: &mut R) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut scratch = [0u8; 8192];
+    loop {
+        match pipe.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(n) => {
+                let remaining = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(out.len());
+                if remaining > 0 {
+                    out.extend_from_slice(&scratch[..n.min(remaining)]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 fn detect_version(app: &AppState, tool: &ToolDefinition) -> Option<String> {
+    // Fast path: if this tool has a package_name, try to read its package.json directly
+    if let Some(pkg_name) = &tool.package_name {
+        let pkg_json_path = app
+            .path(&tool.base_path)
+            .join("node_modules")
+            .join(pkg_name)
+            .join("package.json");
+        if let Ok(content) = fs::read_to_string(&pkg_json_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(ver) = v.get("version").and_then(|v| v.as_str()) {
+                    return Some(ver.to_string());
+                }
+            }
+        }
+    }
+
     if tool.version_command.is_empty() {
         return None;
     }
@@ -1416,6 +1927,12 @@ pub fn get_marketplace_tools(app: &AppState) -> Result<Vec<MarketplaceTool>, App
         .tools
         .into_iter()
         .map(|tool| {
+            validate_marketplace_definition(&tool)?;
+            Ok(tool)
+        })
+        .collect::<Result<Vec<_>, AppError>>()?
+        .into_iter()
+        .map(|tool| {
             let custom_id = format!("custom-{}", tool.id);
             let in_manifest = manifest.tools.iter().any(|t| t.id == tool.id)
                 || manifest.tools.iter().any(|t| t.id == custom_id);
@@ -1448,6 +1965,9 @@ pub fn install_marketplace_tool(
     name: String,         // display name (e.g. "Claude Code", "Codebuff")
     package_name: String, // npm package name
 ) -> Result<ToolCommandResult, AppError> {
+    let _action_guard = ACTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     bootstrap_kit(app)?;
     let manifest = load_manifest(app)?;
     let settings = load_settings(app)?;
@@ -1461,11 +1981,11 @@ pub fn install_marketplace_tool(
         .iter()
         .find(|t| t.id == id || t.id == custom_tool_id)
     {
-        return tool_action(app, ToolActionRequest::new(tool.id.clone(), "install"));
+        return install_tool(app, &manifest, &settings, tool, NPM_INSTALL_TIMEOUT);
     }
 
     // Not in manifest, add as custom tool first, then install
-    add_custom_tool(
+    add_custom_tool_unlocked(
         app,
         name.clone(),
         "npm",
@@ -1480,7 +2000,7 @@ pub fn install_marketplace_tool(
         .iter()
         .find(|t| t.id == custom_tool_id)
     {
-        return install_tool(app, &updated_manifest, &settings, tool);
+        return install_tool(app, &updated_manifest, &settings, tool, NPM_INSTALL_TIMEOUT);
     }
 
     Err(AppError::Message(format!(
@@ -1569,6 +2089,7 @@ fn load_manifest(app: &AppState) -> Result<Manifest, AppError> {
 
     for tool in &mut manifest.tools {
         apply_npm_tool_aliases(tool);
+        validate_tool_definition(tool)?;
     }
 
     Ok(manifest)
@@ -1596,6 +2117,114 @@ fn is_qoder_package_alias(package_name: &str) -> bool {
     )
 }
 
+fn validate_tool_definition(tool: &ToolDefinition) -> Result<(), AppError> {
+    validate_relative_path(&tool.base_path, &format!("{} basePath", tool.id))?;
+    for value in &tool.bin_paths {
+        validate_relative_path(value, &format!("{} binPath", tool.id))?;
+    }
+    validate_command_entry(&tool.version_command, &tool.id, "versionCommand")?;
+    validate_command_entry(&tool.run_command, &tool.id, "runCommand")?;
+    validate_command_entry(&tool.login_command, &tool.id, "loginCommand")?;
+    if let Some(archive_name) = &tool.install.archive_name {
+        validate_file_name(archive_name, &format!("{} archiveName", tool.id))?;
+    }
+    for url in tool.install.urls.values() {
+        validate_http_url(url, "archive url")?;
+    }
+    if let Some(script_url) = &tool.install.script_url {
+        validate_script_url(script_url)?;
+    }
+    for arg in &tool.install.script_args {
+        validate_script_arg(arg, &format!("{} scriptArg", tool.id))?;
+    }
+    if let Some(sha256) = &tool.install.sha256 {
+        validate_sha256_hex(sha256, &format!("{} sha256", tool.id))?;
+    }
+    Ok(())
+}
+
+fn validate_command_entry(command: &[String], tool_id: &str, field: &str) -> Result<(), AppError> {
+    if let Some(entry) = command.first() {
+        validate_relative_path(entry, &format!("{} {}", tool_id, field))?;
+    }
+    Ok(())
+}
+
+fn validate_relative_path(value: &str, label: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Message(format!("{} 不能为空", label)));
+    }
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() {
+        return Err(AppError::Message(format!("{} 不能是绝对路径", label)));
+    }
+    if candidate.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(AppError::Message(format!(
+            "{} 不能包含上级目录或根路径组件",
+            label
+        )));
+    }
+    Ok(trimmed.replace('\\', "/"))
+}
+
+fn validate_file_name(value: &str, label: &str) -> Result<(), AppError> {
+    let normalized = validate_relative_path(value, label)?;
+    if normalized.contains('/') {
+        return Err(AppError::Message(format!("{} 只能是文件名", label)));
+    }
+    Ok(())
+}
+
+fn validate_http_url(value: &str, label: &str) -> Result<(), AppError> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        Ok(())
+    } else {
+        Err(AppError::Message(format!("{} 必须使用 http(s) URL", label)))
+    }
+}
+
+fn validate_script_url(value: &str) -> Result<(), AppError> {
+    let lower = value.trim().to_ascii_lowercase();
+    let is_local_http =
+        lower.starts_with("http://localhost") || lower.starts_with("http://127.0.0.1");
+    if lower.starts_with("https://") || is_local_http {
+        Ok(())
+    } else {
+        Err(AppError::Message(
+            "脚本 URL 必须使用 HTTPS（仅 localhost / 127.0.0.1 允许 HTTP）".to_string(),
+        ))
+    }
+}
+
+fn validate_script_arg(value: &str, label: &str) -> Result<(), AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+        return Err(AppError::Message(format!(
+            "{} 不能为空或包含控制字符",
+            label
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sha256_hex(value: &str, label: &str) -> Result<(), AppError> {
+    let trimmed = value.trim();
+    if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AppError::Message(format!(
+            "{} 必须是 64 位十六进制 SHA-256",
+            label
+        )));
+    }
+    Ok(())
+}
+
 fn load_marketplace(app: &AppState) -> Result<MarketplaceFile, AppError> {
     let path = app.path(MARKETPLACE_PATH);
     if !path.exists() {
@@ -1614,29 +2243,34 @@ fn validate_marketplace_file(app: &AppState) -> Result<(), AppError> {
     }
     let marketplace = load_marketplace(app)?;
     for tool in marketplace.tools {
-        if tool.id.trim().is_empty() {
-            return Err(AppError::Message("工具市场配置包含空 id".to_string()));
-        }
-        if tool.name.trim().is_empty() {
-            return Err(AppError::Message(format!(
-                "工具市场配置 {} 缺少名称",
-                tool.id
-            )));
-        }
-        if tool.package_name.trim().is_empty() {
-            return Err(AppError::Message(format!(
-                "工具市场配置 {} 缺少 packageName",
-                tool.id
-            )));
-        }
-        if tool.homepage.trim().is_empty() {
-            return Err(AppError::Message(format!(
-                "工具市场配置 {} 缺少 homepage",
-                tool.id
-            )));
-        }
+        validate_marketplace_definition(&tool)?;
     }
     Ok(())
+}
+
+fn validate_marketplace_definition(tool: &MarketplaceDefinition) -> Result<(), AppError> {
+    if tool.id.trim().is_empty() {
+        return Err(AppError::Message("工具市场配置包含空 id".to_string()));
+    }
+    if tool.name.trim().is_empty() {
+        return Err(AppError::Message(format!(
+            "工具市场配置 {} 缺少名称",
+            tool.id
+        )));
+    }
+    if tool.package_name.trim().is_empty() {
+        return Err(AppError::Message(format!(
+            "工具市场配置 {} 缺少 packageName",
+            tool.id
+        )));
+    }
+    if tool.homepage.trim().is_empty() {
+        return Err(AppError::Message(format!(
+            "工具市场配置 {} 缺少 homepage",
+            tool.id
+        )));
+    }
+    validate_http_url(&tool.homepage, "homepage")
 }
 
 pub fn load_settings(app: &AppState) -> Result<Settings, AppError> {
@@ -1655,6 +2289,9 @@ pub fn save_settings(
     workspace_path: &str,
     auto_open_workspace: bool,
 ) -> Result<(), AppError> {
+    let _action_guard = ACTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let manifest = load_manifest(app)?;
     let settings_path = sanitize_workspace_path(app, workspace_path, "workspace");
     if !manifest.network_modes.contains_key(network_mode) {
@@ -1768,6 +2405,50 @@ fn persist_action_state(
         entry.last_error = Some(output.chars().take(2000).collect());
     }
     save_state(app, &state)
+}
+
+fn verify_download_integrity(tool: &ToolDefinition, path: &Path) -> Result<(), AppError> {
+    let Some(expected) = tool.install.sha256.as_deref() else {
+        return Ok(());
+    };
+    let actual = file_sha256(path)?;
+    if actual.eq_ignore_ascii_case(expected.trim()) {
+        return Ok(());
+    }
+    Err(AppError::Message(format!(
+        "{} 下载文件 SHA-256 不匹配：expected={}, actual={}",
+        tool.name,
+        expected.trim(),
+        actual
+    )))
+}
+
+fn file_sha256(path: &Path) -> Result<String, AppError> {
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(format!(
+            "$stream = [System.IO.File]::OpenRead('{}'); \
+             try {{ \
+               $sha = [System.Security.Cryptography.SHA256]::Create(); \
+               [System.BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') \
+             }} finally {{ $stream.Dispose() }}",
+            escape_single_quote(&display_path(path))
+        ));
+    let output = run_command_with_timeout(command, std::time::Duration::from_secs(30))
+        .ok_or_else(|| AppError::Message("SHA-256 校验超时".to_string()))?;
+    if !output.status.success() {
+        return Err(AppError::Message(format!(
+            "SHA-256 校验失败：{}",
+            command_output(&output)
+        )));
+    }
+    let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    validate_sha256_hex(&hash, "实际 SHA-256")?;
+    Ok(hash.to_ascii_lowercase())
 }
 
 fn find_tool<'a>(manifest: &'a Manifest, tool_id: &str) -> Result<&'a ToolDefinition, AppError> {
@@ -1927,7 +2608,12 @@ fn prepend_portable_paths(app: &AppState, command: &mut Command) {
 fn command_output(output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
+    let mut combined = format!("{}{}", stdout, stderr);
+    if output.stdout.len() >= MAX_COMMAND_OUTPUT_BYTES
+        || output.stderr.len() >= MAX_COMMAND_OUTPUT_BYTES
+    {
+        combined.push_str("\n[output truncated]\n");
+    }
     strip_terminal_escapes(&combined).trim().to_string()
 }
 
@@ -1996,7 +2682,10 @@ fn quote_cmd_arg(input: &str) -> String {
         return "\"\"".to_string();
     }
     if input.chars().any(|c| CMD_META.contains(&c)) {
-        let escaped = input.replace('"', "\\\"");
+        let escaped = input
+            .replace('%', "%%")
+            .replace('!', "^!")
+            .replace('"', "\\\"");
         return format!("\"{}\"", escaped);
     }
     input.to_string()
@@ -2155,6 +2844,122 @@ fn package_integrity_checks(app: &AppState) -> Vec<HealthCheck> {
     checks
 }
 
+/// Probe the portable root's small-file write speed by writing and deleting
+/// 10 tiny files in `state/temp/`. Returns (ms_per_file, CheckStatus, message).
+///
+/// Skipped entirely when `force` is false so normal dashboard loads stay fast.
+fn probe_write_speed(app: &AppState, force: bool) -> Option<HealthCheck> {
+    if !force {
+        return None;
+    }
+
+    let probe_dir = app.path("state/temp/_speed_probe");
+    let _ = fs::remove_dir_all(&probe_dir);
+    if fs::create_dir_all(&probe_dir).is_err() {
+        return Some(HealthCheck {
+            id: "root-write-speed".to_string(),
+            label: "根目录写入速度".to_string(),
+            status: CheckStatus::Error,
+            message: "无法创建临时目录进行写入速度检测".to_string(),
+        });
+    }
+
+    const NUM_FILES: usize = 10;
+    let start = std::time::Instant::now();
+    let mut ok = true;
+    for i in 0..NUM_FILES {
+        let path = probe_dir.join(format!("probe_{}.tmp", i));
+        if fs::write(&path, [0u8; 100]).is_err() {
+            ok = false;
+            break;
+        }
+    }
+    // Sync the directory to flush metadata to disk (approximate on Windows).
+    let _ = std::fs::File::open(&probe_dir).and_then(|f| f.sync_data());
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let _ = fs::remove_dir_all(&probe_dir);
+
+    if !ok || NUM_FILES == 0 {
+        return Some(HealthCheck {
+            id: "root-write-speed".to_string(),
+            label: "根目录写入速度".to_string(),
+            status: CheckStatus::Error,
+            message: "写入速度检测失败".to_string(),
+        });
+    }
+
+    let ms_per_file = elapsed_ms / NUM_FILES as u64;
+
+    let (status, message) = if ms_per_file <= 5 {
+        (
+            CheckStatus::Ok,
+            format!(
+                "写入速度正常（约 {:.0} 个文件/秒）",
+                1000.0 / ms_per_file as f64
+            ),
+        )
+    } else if ms_per_file <= 100 {
+        (
+            CheckStatus::Warning,
+            format!(
+                "写入速度偏慢（约 {:.0} 个文件/秒），大型 AI CLI 安装可能需要较长时间",
+                1000.0 / ms_per_file as f64
+            ),
+        )
+    } else {
+        (
+            CheckStatus::Error,
+            format!(
+                "写入速度极慢（约 {:.0} 个文件/秒），npm 安装/更新可能超时失败。建议：在设置中增大超时时间",
+                1000.0 / ms_per_file as f64
+            ),
+        )
+    };
+
+    Some(HealthCheck {
+        id: "root-write-speed".to_string(),
+        label: "根目录写入速度".to_string(),
+        status,
+        message,
+    })
+}
+
+fn download_integrity_checks(manifest: &Manifest) -> Vec<HealthCheck> {
+    manifest
+        .tools
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool.install.install_type,
+                InstallType::Archive | InstallType::PowershellScript
+            )
+        })
+        .map(|tool| {
+            let has_hash = tool
+                .install
+                .sha256
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+            HealthCheck {
+                id: format!("download-integrity-{}", tool.id),
+                label: format!("{} 下载完整性", tool.name),
+                status: if has_hash {
+                    CheckStatus::Ok
+                } else {
+                    CheckStatus::Warning
+                },
+                message: if has_hash {
+                    "已配置 SHA-256 校验".to_string()
+                } else {
+                    "未配置 SHA-256；下载后无法做固定 hash 校验".to_string()
+                },
+            }
+        })
+        .collect()
+}
+
 fn summarize_checks(checks: &[HealthCheck]) -> HealthSummary {
     if checks
         .iter()
@@ -2245,6 +3050,20 @@ pub fn add_custom_tool(
     script_url: Option<String>,
     bin_name: Option<String>,
 ) -> Result<String, AppError> {
+    let _action_guard = ACTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    add_custom_tool_unlocked(app, name, install_type, package_name, script_url, bin_name)
+}
+
+fn add_custom_tool_unlocked(
+    app: &AppState,
+    name: String,
+    install_type: &str,
+    package_name: Option<String>,
+    script_url: Option<String>,
+    bin_name: Option<String>,
+) -> Result<String, AppError> {
     // Sanitize name to generate a valid tool ID (ASCII-only to avoid
     // codepage issues in Windows .bat / cmd execution).
     let trimmed_name = name.trim();
@@ -2325,14 +3144,7 @@ pub fn add_custom_tool(
         if script_url_val.is_empty() {
             return Err(AppError::Message("脚本 URL 不能为空".to_string()));
         }
-        let url_lower = script_url_val.to_lowercase();
-        let is_local_http =
-            url_lower.starts_with("http://localhost") || url_lower.starts_with("http://127.0.0.1");
-        if !(url_lower.starts_with("https://") || is_local_http) {
-            return Err(AppError::Message(
-                "脚本 URL 必须使用 HTTPS（仅 localhost / 127.0.0.1 允许 HTTP）".to_string(),
-            ));
-        }
+        validate_script_url(&script_url_val)?;
 
         let actual_bin = bin_name.unwrap_or_default().trim().to_string();
         // Reject any path-like component to prevent the binary entry from
@@ -2385,6 +3197,8 @@ pub fn add_custom_tool(
                 installer_type: None,
                 urls: BTreeMap::new(),
                 script_url: Some(script_url_val),
+                script_args: vec![],
+                sha256: None,
             },
         }
     } else {
@@ -2422,6 +3236,8 @@ pub fn add_custom_tool(
                 installer_type: None,
                 urls: BTreeMap::new(),
                 script_url: None,
+                script_args: vec![],
+                sha256: None,
             },
         }
     };
@@ -2441,6 +3257,9 @@ pub fn add_custom_tool(
 }
 
 pub fn delete_custom_tool(app: &AppState, tool_id: String) -> Result<(), AppError> {
+    let _action_guard = ACTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !tool_id.starts_with("custom-") {
         return Err(AppError::Message("只能删除自定义工具".to_string()));
     }
@@ -2476,6 +3295,8 @@ pub fn delete_custom_tool(app: &AppState, tool_id: String) -> Result<(), AppErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::ExitStatusExt;
 
     fn fixture() -> (tempfile::TempDir, AppState) {
         let temp = tempfile::tempdir().unwrap();
@@ -2539,6 +3360,197 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_clears_stale_version_when_tool_directory_is_missing() {
+        let (_temp, app) = fixture();
+        let mut state = ToolStateFile::default();
+        state.tools.insert(
+            "node".to_string(),
+            PersistedToolState {
+                installed_version: Some("v0.0.1".to_string()),
+                installed_at: Some("2026-01-01T00:00:00Z".to_string()),
+                last_error: Some("old error".to_string()),
+                ..PersistedToolState::default()
+            },
+        );
+        save_state(&app, &state).unwrap();
+
+        let dashboard = get_dashboard(&app, false).unwrap();
+        assert_eq!(dashboard.tools[0].status, ToolStatus::Missing);
+        assert_eq!(dashboard.tools[0].installed_version, None);
+        assert!(dashboard.tools[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("未找到安装目录"));
+
+        let saved = load_state(&app).unwrap();
+        assert_eq!(
+            saved
+                .tools
+                .get("node")
+                .and_then(|tool| tool.installed_version.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn dashboard_replaces_stale_error_when_tool_entrypoint_is_missing() {
+        let (_temp, app) = fixture();
+        fs::create_dir_all(app.path("apps/node")).unwrap();
+        let mut state = ToolStateFile::default();
+        state.tools.insert(
+            "node".to_string(),
+            PersistedToolState {
+                installed_version: Some("v0.0.1".to_string()),
+                last_error: Some("old npm error".to_string()),
+                ..PersistedToolState::default()
+            },
+        );
+        save_state(&app, &state).unwrap();
+
+        let dashboard = get_dashboard(&app, false).unwrap();
+        assert_eq!(dashboard.tools[0].status, ToolStatus::Partial);
+        assert_eq!(dashboard.tools[0].installed_version, None);
+        assert!(dashboard.tools[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("node.exe"));
+        assert!(!dashboard.tools[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("old npm error"));
+    }
+
+    #[test]
+    fn ready_tool_rechecks_version_and_clears_stale_error() {
+        let (_temp, app) = fixture();
+        let tool = ToolDefinition {
+            id: "codex".to_string(),
+            name: "Codex CLI".to_string(),
+            kind: ToolKind::AiCli,
+            required: false,
+            base_path: "tools/codex".to_string(),
+            package_name: Some("@openai/codex@latest".to_string()),
+            version_command: vec![
+                "node_modules/.bin/codex.cmd".to_string(),
+                "--version".to_string(),
+            ],
+            host_version_command: vec![],
+            bin_paths: vec!["node_modules/.bin/codex.cmd".to_string()],
+            run_command: vec![],
+            login_command: vec![],
+            install: InstallDefinition {
+                install_type: InstallType::Npm,
+                depends_on: vec!["node".to_string()],
+                archive_name: None,
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: None,
+                script_args: vec![],
+                sha256: None,
+            },
+        };
+        let bin_path = app
+            .path(&tool.base_path)
+            .join("node_modules/.bin/codex.cmd");
+        fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        fs::write(&bin_path, "@echo off\r\necho codex-cli 1.2.3\r\n").unwrap();
+        let mut state = ToolStateFile::default();
+        state.tools.insert(
+            tool.id.clone(),
+            PersistedToolState {
+                installed_version: Some("codex-cli 0.0.1".to_string()),
+                last_error: Some("old npm error".to_string()),
+                ..PersistedToolState::default()
+            },
+        );
+
+        let view = tool_view(&app, &tool, &mut state, false).unwrap();
+        assert_eq!(view.status, ToolStatus::Ready);
+        assert_eq!(view.installed_version.as_deref(), Some("codex-cli 1.2.3"));
+        assert_eq!(view.last_error, None);
+        assert_eq!(
+            state
+                .tools
+                .get(&tool.id)
+                .and_then(|tool| tool.last_error.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn ready_tool_uses_cached_version_until_forced_refresh() {
+        let (_temp, app) = fixture();
+        let tool = ToolDefinition {
+            id: "claude".to_string(),
+            name: "Claude Code".to_string(),
+            kind: ToolKind::AiCli,
+            required: false,
+            base_path: "tools/claude".to_string(),
+            package_name: Some("@anthropic-ai/claude-code@latest".to_string()),
+            version_command: vec![
+                "node_modules/.bin/claude.cmd".to_string(),
+                "--version".to_string(),
+            ],
+            host_version_command: vec![],
+            bin_paths: vec!["node_modules/.bin/claude.cmd".to_string()],
+            run_command: vec![],
+            login_command: vec![],
+            install: InstallDefinition {
+                install_type: InstallType::Npm,
+                depends_on: vec!["node".to_string()],
+                archive_name: None,
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: None,
+                script_args: vec![],
+                sha256: None,
+            },
+        };
+        let bin_path = app
+            .path(&tool.base_path)
+            .join("node_modules/.bin/claude.cmd");
+        fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        fs::write(&bin_path, "@echo off\r\necho 2.1.168 (Claude Code)\r\n").unwrap();
+        let mut state = ToolStateFile::default();
+        state.tools.insert(
+            tool.id.clone(),
+            PersistedToolState {
+                installed_version: Some("2.1.133 (Claude Code)".to_string()),
+                ..PersistedToolState::default()
+            },
+        );
+
+        let view = tool_view(&app, &tool, &mut state, false).unwrap();
+        assert_eq!(
+            view.installed_version.as_deref(),
+            Some("2.1.133 (Claude Code)")
+        );
+        assert_eq!(
+            state
+                .tools
+                .get(&tool.id)
+                .and_then(|tool| tool.installed_version.as_deref()),
+            Some("2.1.133 (Claude Code)")
+        );
+
+        let view = tool_view(&app, &tool, &mut state, true).unwrap();
+        assert_eq!(
+            view.installed_version.as_deref(),
+            Some("2.1.168 (Claude Code)")
+        );
+        assert_eq!(
+            state
+                .tools
+                .get(&tool.id)
+                .and_then(|tool| tool.installed_version.as_deref()),
+            Some("2.1.168 (Claude Code)")
+        );
+    }
+
+    #[test]
     fn dashboard_reports_ready_tool_when_binary_exists() {
         let (_temp, app) = fixture();
         fs::create_dir_all(app.path("apps/node")).unwrap();
@@ -2597,6 +3609,8 @@ mod tests {
                 installer_type: None,
                 urls: BTreeMap::new(),
                 script_url: None,
+                script_args: vec![],
+                sha256: None,
             },
         };
         let index_path = app
@@ -2659,6 +3673,8 @@ async function checkForUpdates(runningProcess, exitListener) {
                 installer_type: None,
                 urls: BTreeMap::new(),
                 script_url: None,
+                script_args: vec![],
+                sha256: None,
             },
         };
         let bin_path = app
@@ -2690,6 +3706,211 @@ async function checkForUpdates(runningProcess, exitListener) {
     fn display_path_removes_windows_extended_prefix() {
         let path = PathBuf::from(r"\\?\E:\kit\config");
         assert_eq!(display_path(&path), r"E:\kit\config");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tar_timestamp_restore_warnings_are_tolerated() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: vec![],
+            stderr: b"node-v24.11.1-win-x64/npm.ps1: Can't restore time: Invalid argument\r\nnode-v24.11.1-win-x64/npx: Can't restore time: Invalid argument\r\n".to_vec(),
+        };
+
+        assert!(tar_output_only_has_timestamp_warnings(&output));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tar_real_errors_are_not_tolerated() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: vec![],
+            stderr: b"node.zip: Truncated ZIP file\r\n".to_vec(),
+        };
+
+        assert!(!tar_output_only_has_timestamp_warnings(&output));
+    }
+
+    #[test]
+    fn manifest_rejects_tool_paths_that_escape_root() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MANIFEST_PATH),
+            r#"{
+              "schemaVersion": 1,
+              "networkModes": {"global": {"npmRegistry": "https://registry.npmjs.org/", "archiveSource": "global"}},
+              "tools": [{
+                "id": "bad",
+                "name": "Bad",
+                "kind": "runtime",
+                "required": true,
+                "basePath": "../outside",
+                "binPaths": ["bad.exe"],
+                "install": {"type": "archive", "archiveName": "bad.zip", "installerType": "zip", "urls": {"global": "https://example.invalid/bad.zip"}}
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let error = load_manifest(&app).unwrap_err();
+        assert!(error.to_string().contains("basePath"));
+    }
+
+    #[test]
+    fn marketplace_rejects_non_http_homepage() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MARKETPLACE_PATH),
+            r#"{"tools":[{"id":"bad","name":"Bad","description":"bad","packageName":"bad","category":"AI CLI","homepage":"javascript:alert(1)"}]}"#,
+        )
+        .unwrap();
+
+        let error = get_marketplace_tools(&app).unwrap_err();
+        assert!(error.to_string().contains("homepage"));
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_sha256() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MANIFEST_PATH),
+            r#"{
+              "schemaVersion": 1,
+              "networkModes": {"global": {"npmRegistry": "https://registry.npmjs.org/", "archiveSource": "global"}},
+              "tools": [{
+                "id": "bad",
+                "name": "Bad",
+                "kind": "runtime",
+                "required": true,
+                "basePath": "apps/bad",
+                "binPaths": ["bad.exe"],
+                "install": {"type": "archive", "archiveName": "bad.zip", "installerType": "zip", "sha256": "bad", "urls": {"global": "https://example.invalid/bad.zip"}}
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let error = load_manifest(&app).unwrap_err();
+        assert!(error.to_string().contains("sha256"));
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_script_arg() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MANIFEST_PATH),
+            r#"{
+              "schemaVersion": 1,
+              "networkModes": {"global": {"npmRegistry": "https://registry.npmjs.org/", "archiveSource": "global"}},
+              "tools": [{
+                "id": "bad",
+                "name": "Bad",
+                "kind": "ai-cli",
+                "required": false,
+                "basePath": "tools/bad",
+                "binPaths": ["bad.exe"],
+                "install": {"type": "powershell-script", "scriptUrl": "https://example.invalid/install.ps1", "scriptArgs": ["--skip-path\nbad"]}
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let error = load_manifest(&app).unwrap_err();
+        assert!(error.to_string().contains("scriptArg"));
+    }
+
+    #[test]
+    fn manifest_loads_script_args() {
+        let (_temp, app) = fixture();
+        fs::write(
+            app.path(MANIFEST_PATH),
+            r#"{
+              "schemaVersion": 1,
+              "networkModes": {"global": {"npmRegistry": "https://registry.npmjs.org/", "archiveSource": "global"}},
+              "tools": [{
+                "id": "agy",
+                "name": "AGY",
+                "kind": "ai-cli",
+                "required": false,
+                "basePath": "tools/agy",
+                "binPaths": ["agy.exe"],
+                "install": {
+                  "type": "powershell-script",
+                  "scriptUrl": "https://example.invalid/install.ps1",
+                  "scriptArgs": ["--skip-path", "--skip-aliases"],
+                  "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let manifest = load_manifest(&app).unwrap();
+        assert_eq!(
+            manifest.tools[0].install.script_args,
+            vec!["--skip-path".to_string(), "--skip-aliases".to_string()]
+        );
+    }
+
+    #[test]
+    fn health_warns_when_remote_install_lacks_sha256() {
+        let (_temp, app) = fixture();
+        let dashboard = get_dashboard(&app, false).unwrap();
+        let check = dashboard
+            .health
+            .checks
+            .iter()
+            .find(|check| check.id == "download-integrity-node")
+            .expect("download integrity check missing");
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.message.contains("SHA-256"));
+    }
+
+    #[test]
+    fn verify_download_integrity_rejects_hash_mismatch() {
+        let (_temp, app) = fixture();
+        let path = app.path("cache/downloads/test.txt");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "hello").unwrap();
+        let tool = ToolDefinition {
+            id: "hash-test".to_string(),
+            name: "Hash Test".to_string(),
+            kind: ToolKind::Runtime,
+            required: false,
+            base_path: "apps/hash-test".to_string(),
+            package_name: None,
+            version_command: vec![],
+            host_version_command: vec![],
+            bin_paths: vec![],
+            run_command: vec![],
+            login_command: vec![],
+            install: InstallDefinition {
+                install_type: InstallType::Archive,
+                depends_on: vec![],
+                archive_name: Some("test.txt".to_string()),
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: None,
+                script_args: vec![],
+                sha256: Some(
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                ),
+            },
+        };
+
+        let error = verify_download_integrity(&tool, &path).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("expected="));
+    }
+
+    #[test]
+    fn quote_cmd_arg_escapes_batch_expansion_tokens() {
+        let quoted = quote_cmd_arg("%PATH% & echo !SECRET!");
+        assert!(quoted.contains("%%PATH%%"));
+        assert!(quoted.contains("^!SECRET^!"));
+        assert!(quoted.starts_with('"'));
+        assert!(quoted.ends_with('"'));
     }
 
     #[test]
@@ -2967,5 +4188,162 @@ async function checkForUpdates(runningProcess, exitListener) {
             "\u{1b}[32m installed\u{1b}[0m\r\nadded 5 packages\r\u{1b}]0;title\u{07}\u{1b}M中文";
         let cleaned = strip_terminal_escapes(raw);
         assert_eq!(cleaned, " installed\nadded 5 packages中文");
+    }
+
+    #[test]
+    fn npm_install_failure_preserves_existing_install_via_rollback() {
+        // swap_npm_install_into_place must restore the previous install when the
+        // final move fails. We force a failure by moving the staging tree out
+        // from under the swap call so fs::rename(staging, destination) hits a
+        // "file not found" error, exercising the rollback branch.
+        let (_temp, app) = fixture();
+        let tool = ToolDefinition {
+            id: "claude".to_string(),
+            name: "Claude Code".to_string(),
+            kind: ToolKind::AiCli,
+            required: false,
+            base_path: "tools/claude".to_string(),
+            package_name: Some("@anthropic-ai/claude-code@latest".to_string()),
+            version_command: vec![],
+            host_version_command: vec![],
+            bin_paths: vec![],
+            run_command: vec![],
+            login_command: vec![],
+            install: InstallDefinition {
+                install_type: InstallType::Npm,
+                depends_on: vec!["node".to_string()],
+                archive_name: None,
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: None,
+                script_args: vec![],
+                sha256: None,
+            },
+        };
+
+        // Existing install on the portable (temp) drive.
+        let destination = app.path(&tool.base_path);
+        fs::create_dir_all(destination.join("node_modules")).unwrap();
+        fs::write(destination.join("node_modules").join("marker.txt"), "old").unwrap();
+
+        // Staging tree on local temp.
+        let staging = env::temp_dir()
+            .join("portable-ai-dev-kit")
+            .join("npm-staging-test-rollback");
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(staging.join("node_modules")).unwrap();
+
+        // Move staging out of the way so swap's rename fails after the
+        // existing install has been preserved to backup.
+        let moved_staging = env::temp_dir()
+            .join("portable-ai-dev-kit")
+            .join("npm-staging-moved-rollback");
+        let _ = fs::remove_dir_all(&moved_staging);
+        fs::rename(&staging, &moved_staging).unwrap();
+
+        let result = swap_npm_install_into_place(&app, &tool, staging.clone());
+        assert!(result.is_err(), "swap should fail when rename is blocked");
+
+        // Rollback restored the original install tree.
+        assert!(
+            destination.is_dir(),
+            "destination should be restored as a dir"
+        );
+        let marker = destination.join("node_modules").join("marker.txt");
+        assert!(
+            marker.exists(),
+            "previous install content must survive rollback"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "old");
+
+        // No dangling backup left.
+        let backup = app.path("cache/extract/claude-backup");
+        assert!(
+            !backup.exists(),
+            "backup must be cleaned up on rollback path"
+        );
+        let _ = fs::remove_dir_all(&moved_staging);
+    }
+
+    #[test]
+    fn npm_staging_swap_moves_tree_into_place_and_clears_backup() {
+        let (_temp, app) = fixture();
+        let tool = ToolDefinition {
+            id: "codex".to_string(),
+            name: "Codex CLI".to_string(),
+            kind: ToolKind::AiCli,
+            required: false,
+            base_path: "tools/codex".to_string(),
+            package_name: Some("@openai/codex@latest".to_string()),
+            version_command: vec![],
+            host_version_command: vec![],
+            bin_paths: vec![],
+            run_command: vec![],
+            login_command: vec![],
+            install: InstallDefinition {
+                install_type: InstallType::Npm,
+                depends_on: vec!["node".to_string()],
+                archive_name: None,
+                installer_type: None,
+                urls: BTreeMap::new(),
+                script_url: None,
+                script_args: vec![],
+                sha256: None,
+            },
+        };
+
+        // Pretend an old install exists.
+        let destination = app.path(&tool.base_path);
+        fs::create_dir_all(destination.join("node_modules/.old")).unwrap();
+
+        // Build a staging dir that looks like a fresh install.
+        let staging = env::temp_dir()
+            .join("portable-ai-dev-kit")
+            .join("npm-staging-test-success");
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(staging.join("node_modules/.bin")).unwrap();
+        fs::write(staging.join("node_modules/.bin").join("codex.cmd"), "new").unwrap();
+
+        swap_npm_install_into_place(&app, &tool, staging).unwrap();
+
+        // New tree is in place at destination.
+        let new_bin = destination.join("node_modules/.bin/codex.cmd");
+        assert!(
+            new_bin.exists(),
+            "new install must be at the tool base path"
+        );
+        assert_eq!(fs::read_to_string(&new_bin).unwrap(), "new");
+        // Old content is gone (it was moved to backup, then backup removed).
+        assert!(!destination.join("node_modules/.old").exists());
+
+        let backup = app.path("cache/extract/codex-backup");
+        assert!(
+            !backup.exists(),
+            "backup must be removed after a successful swap"
+        );
+    }
+
+    #[test]
+    fn probe_write_speed_returns_ok_on_fast_disk() {
+        let (_temp, app) = fixture();
+        // force=true triggers the probe
+        let check = probe_write_speed(&app, true).expect("probe should return a check");
+        assert_eq!(check.id, "root-write-speed");
+        assert!(
+            check.status == CheckStatus::Ok || check.status == CheckStatus::Warning,
+            "fast disk should not error: {:?}",
+            check.status
+        );
+        assert!(!check.message.is_empty());
+    }
+
+    #[test]
+    fn probe_write_speed_skipped_when_not_forced() {
+        let (_temp, app) = fixture();
+        let result = probe_write_speed(&app, false);
+        assert!(
+            result.is_none(),
+            "probe should return None when force=false"
+        );
     }
 }
